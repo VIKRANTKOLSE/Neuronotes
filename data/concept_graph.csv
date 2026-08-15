@@ -1,0 +1,86 @@
+source_concept,target_concept,relation,weight,expert_validated
+Effective Nuclear Charge,Shielding Effect,prerequisite,1.0,True
+Effective Nuclear Charge,Orbital Penetration,prerequisite,1.0,True
+Shielding Effect,Orbital Penetration,prerequisite,1.0,True
+Effective Nuclear Charge,Electron-Electron Repulsion,prerequisite,1.0,True
+Shielding Effect,Electron-Electron Repulsion,prerequisite,1.0,True
+Orbital Penetration,Energy Level Splitting in Atomic Orbitals,prerequisite,1.0,True
+Shielding Effect,Energy Level Splitting in Atomic Orbitals,prerequisite,1.0,True
+Energy Level Splitting in Atomic Orbitals,Exchange Energy and Half-Filled Shell Stability,prerequisite,1.0,True
+Effective Nuclear Charge,Atomic Radius Trend,prerequisite,1.0,True
+Shielding Effect,Atomic Radius Trend,prerequisite,1.0,True
+Atomic Radius Trend,Ionization Enthalpy Trend,prerequisite,1.0,True
+Effective Nuclear Charge,Ionization Enthalpy Trend,prerequisite,1.0,True
+Ionization Enthalpy Trend,Third Ionization Enthalpy Anomalies,prerequisite,1.0,True
+Atomic Radius Trend,Electron Gain Enthalpy Trend,prerequisite,1.0,True
+Electron-Electron Repulsion,Electron Gain Enthalpy Trend,prerequisite,1.0,True
+Ionization Enthalpy Trend,Electronegativity Trend,prerequisite,1.0,True
+Atomic Radius Trend,Electronegativity Trend,prerequisite,1.0,True
+Atomic Radius Trend,Charge Density (Z/r) and Ionic Potential,prerequisite,1.0,True
+Charge Density (Z/r) and Ionic Potential,Lattice Energy,prerequisite,1.0,True
+Ionization Enthalpy Trend,Inert Pair Effect,prerequisite,1.0,True
+Charge Density (Z/r) and Ionic Potential,Diagonal Relationship,prerequisite,1.0,True
+Electronegativity Trend,Diagonal Relationship,prerequisite,1.0,True
+Lattice Energy,Thermal Stability from Lattice Energy and Polarization,prerequisite,1.0,True
+Polarization Effects (Fajan's Rule + Polarizing Power),Thermal Stability from Lattice Energy and Polarization,prerequisite,1.0,True
+Charge Density (Z/r) and Ionic Potential,Polarization Effects (Fajan's Rule + Polarizing Power),prerequisite,1.0,True
+Standard Electrode Potential Trends in d-block,Redox Stability and Disproportionation Tendencies,prerequisite,1.0,True
+Orbital Penetration,Sigma and Pi Bonding in Molecular Orbitals,prerequisite,1.0,True
+Sigma and Pi Bonding in Molecular Orbitals,Hybridization and Orbital Mixing Principles,prerequisite,1.0,True
+Hybridization and Orbital Mixing Principles,Valence Shell Electron Pair Repulsion Theory,prerequisite,1.0,True
+Valence Shell Electron Pair Repulsion Theory,VSEPR Application to Hypervalent Molecules,prerequisite,1.0,True
+VSEPR Application to Hypervalent Molecules,VSEPR Hypervalent Geometry,prerequisite,1.0,True
+Hybridization and Orbital Mixing Principles,Bent's Rule,prerequisite,1.0,True
+Valence Shell Electron Pair Repulsion Theory,Dipole Moment and Molecular Polarity,prerequisite,1.0,True
+Electronegativity Trend,Dipole Moment and Molecular Polarity,prerequisite,1.0,True
+Electronegativity Trend,Hydrogen Bonding,prerequisite,1.0,True
+Dipole Moment and Molecular Polarity,Hydrogen Bonding,prerequisite,1.0,True
+Sigma and Pi Bonding in Molecular Orbitals,Molecular Orbital Theory and Delocalization,prerequisite,1.0,True
+Sigma and Pi Bonding in Molecular Orbitals,Back Bonding,prerequisite,1.0,True
+Orbital Penetration,Back Bonding,prerequisite,1.0,True
+Sigma and Pi Bonding in Molecular Orbitals,Electron-Deficient Bonding in Boranes,prerequisite,1.0,True
+Electronegativity Trend,Oxoacid Strength and Basicity from Structure,prerequisite,1.0,True
+Polarization Effects (Fajan's Rule + Polarizing Power),Oxoacid Strength and Basicity from Structure,prerequisite,1.0,True
+Hybridization and Orbital Mixing Principles,Noble Gas Compound Stability,prerequisite,1.0,True
+VSEPR Hypervalent Geometry,Noble Gas Compound Stability,prerequisite,1.0,True
+Sigma and Pi Bonding in Molecular Orbitals,Polymerization of Silicate Units,prerequisite,1.0,True
+Hybridization and Orbital Mixing Principles,Coordination Number and Geometry Relationships,prerequisite,1.0,True
+Coordination Number and Geometry Relationships,Ligand Denticity and Polydentate Binding,prerequisite,1.0,True
+Ligand Denticity and Polydentate Binding,Chelate Effect,prerequisite,1.0,True
+Coordination Number and Geometry Relationships,Metal-Ligand Bonding (σ and π interactions in complexes),prerequisite,1.0,True
+Back Bonding,Metal-Ligand Bonding (σ and π interactions in complexes),prerequisite,1.0,True
+Coordination Number and Geometry Relationships,Crystal Field Splitting in Octahedral Field,prerequisite,1.0,True
+Crystal Field Splitting in Octahedral Field,Crystal Field Splitting in Tetrahedral Field,prerequisite,1.0,True
+Crystal Field Splitting in Octahedral Field,Crystal Field Stabilization Energy,prerequisite,1.0,True
+Crystal Field Splitting in Octahedral Field,High-Spin vs Low-Spin Complexes,prerequisite,1.0,True
+Spectrochemical Series,High-Spin vs Low-Spin Complexes,prerequisite,1.0,True
+Metal-Ligand Bonding (σ and π interactions in complexes),Spectrochemical Series,prerequisite,1.0,True
+Crystal Field Splitting in Octahedral Field,Jahn-Teller Distortion,prerequisite,1.0,True
+Crystal Field Splitting in Octahedral Field,Ligand Field Theory,prerequisite,1.0,True
+Molecular Orbital Theory and Delocalization,Ligand Field Theory,prerequisite,1.0,True
+Metal-Ligand Bonding (σ and π interactions in complexes),t2g Orbital Pi Bonding,prerequisite,1.0,True
+Crystal Field Splitting in Octahedral Field,t2g Orbital Pi Bonding,prerequisite,1.0,True
+Crystal Field Stabilization Energy,Magnetic Properties from Unpaired d-electrons,prerequisite,1.0,True
+High-Spin vs Low-Spin Complexes,Magnetic Properties from Unpaired d-electrons,prerequisite,1.0,True
+Crystal Field Splitting in Octahedral Field,Color Origin in Coordination Compounds,prerequisite,1.0,True
+Spectrochemical Series,Color Origin in Coordination Compounds,prerequisite,1.0,True
+Metal-Ligand Bonding (σ and π interactions in complexes),Stability Constants of Complexes,prerequisite,1.0,True
+Chelate Effect,Stability Constants of Complexes,prerequisite,1.0,True
+Coordination Number and Geometry Relationships,Geometric Isomerism in Coordination Compounds,prerequisite,1.0,True
+Geometric Isomerism in Coordination Compounds,Optical Isomerism in Coordination Compounds,prerequisite,1.0,True
+Coordination Number and Geometry Relationships,Linkage Isomerism,prerequisite,1.0,True
+Electronegativity Trend,HSAB Principle,prerequisite,1.0,True
+Polarization Effects (Fajan's Rule + Polarizing Power),HSAB Principle,prerequisite,1.0,True
+HSAB Principle,Hard and Soft Acids and Bases (HSAB) Principle,prerequisite,1.0,True
+Ionization Enthalpy Trend,Variable Oxidation State Stability in d-block,prerequisite,1.0,True
+Crystal Field Stabilization Energy,Variable Oxidation State Stability in d-block,prerequisite,1.0,True
+Variable Oxidation State Stability in d-block,Standard Electrode Potential Trends in d-block,prerequisite,1.0,True
+Atomic Radius Trend,Lanthanoid Contraction,prerequisite,1.0,True
+Effective Nuclear Charge,Lanthanoid Contraction,prerequisite,1.0,True
+Lanthanoid Contraction,Actinoid Contraction,prerequisite,1.0,True
+Lanthanoid Contraction,4d and 5d Series Similarity Post-Lanthanoid Contraction,prerequisite,1.0,True
+Lattice Energy,Ellingham Diagram and Thermodynamic Feasibility,prerequisite,1.0,True
+Ellingham Diagram and Thermodynamic Feasibility,Electrochemical Reduction Principles in Metallurgy,prerequisite,1.0,True
+Standard Electrode Potential Trends in d-block,Electrochemical Reduction Principles in Metallurgy,prerequisite,1.0,True
+Lattice Energy,Solubility Product and Precipitation Logic,prerequisite,1.0,True
+Charge Density (Z/r) and Ionic Potential,Solubility Product and Precipitation Logic,prerequisite,1.0,True
