@@ -104,9 +104,12 @@ class CCMIRT:
 
     def __init__(self,
                  concept_graph_path: Optional[Path] = None,
-                 prereq_slack: float = PREREQ_SLACK):
+                 prereq_slack: float = PREREQ_SLACK,
+                 weight_calibration_interval: int = 100):
         self.n_dims = N_DIMS
         self.prereq_slack = prereq_slack
+        self.weight_calibration_interval = max(1, int(weight_calibration_interval))
+        self._prereq_attempt_log: list[dict] = []
         self._graph: nx.DiGraph = self._load_graph(concept_graph_path)
 
     # ------------------------------------------------------------------
@@ -141,23 +144,79 @@ class CCMIRT:
     # ------------------------------------------------------------------
     # Prerequisite constraint
     # ------------------------------------------------------------------
+    def prereq_penalty(self, theta_by_concept: dict[str, float]) -> float:
+        """Graph loss: sum w_uv * max(0, theta_v-theta_u-epsilon)^2.
+
+        Edges lacking an observed endpoint are excluded; unknown concepts must
+        not be treated as zero mastery during an adaptive session.
+        """
+        loss = 0.0
+        for source, target, data in self._graph.edges(data=True):
+            if source not in theta_by_concept or target not in theta_by_concept:
+                continue
+            violation = theta_by_concept[target] - theta_by_concept[source] - self.prereq_slack
+            if violation > 0:
+                loss += float(data.get("weight", 1.0)) * violation ** 2
+        return float(loss)
+
+    def prereq_penalty_gradients(self, theta_by_concept: dict[str, float]) -> dict[str, float]:
+        """Return the gradient of the soft prerequisite loss by concept."""
+        gradients = {concept: 0.0 for concept in theta_by_concept}
+        for source, target, data in self._graph.edges(data=True):
+            if source not in theta_by_concept or target not in theta_by_concept:
+                continue
+            violation = theta_by_concept[target] - theta_by_concept[source] - self.prereq_slack
+            if violation > 0:
+                grad = 2.0 * float(data.get("weight", 1.0)) * violation
+                gradients[target] += grad
+                gradients[source] -= grad
+        return gradients
+
+    def apply_soft_prereq_penalty(self,
+                                  theta: np.ndarray,
+                                  theta_by_concept: dict[str, float],
+                                  learning_rate: float = 0.05) -> np.ndarray:
+        """Take one gradient step on the prerequisite loss without clipping."""
+        gradients = self.prereq_penalty_gradients(theta_by_concept)
+        for concept, gradient in gradients.items():
+            if gradient == 0.0:
+                continue
+            dim = CONCEPT_DIM_MAP.get(concept, 0)
+            theta[dim] -= learning_rate * gradient
+            theta_by_concept[concept] -= learning_rate * gradient
+        return np.clip(theta, -4.0, 4.0)
+
+    def record_prereq_observation(self, concept: str, correct: bool) -> None:
+        """Accumulate response evidence and periodically recalibrate edge weights."""
+        self._prereq_attempt_log.append({"concept": concept, "correct": float(correct)})
+        if len(self._prereq_attempt_log) % self.weight_calibration_interval == 0:
+            self.calibrate_prereq_weights()
+
+    def calibrate_prereq_weights(self, attempts: Optional[list[dict]] = None) -> None:
+        """Fit edge strengths from observed prerequisite/target performance.
+
+        An edge gains weight when target accuracy outpaces its prerequisite,
+        which is evidence that the graph penalty needs to pull the estimates
+        toward a more plausible ordering. A smoothed update prevents a small
+        response batch from dominating expert-initialized weights.
+        """
+        logs = attempts if attempts is not None else self._prereq_attempt_log
+        if not logs:
+            return
+        frame = pd.DataFrame(logs)
+        accuracy = frame.groupby("concept")["correct"].mean().to_dict()
+        for source, target, data in self._graph.edges(data=True):
+            if source not in accuracy or target not in accuracy:
+                continue
+            target_weight = 1.0 + max(0.0, float(accuracy[target] - accuracy[source]))
+            current = float(data.get("weight", 1.0))
+            data["weight"] = float(np.clip(0.8 * current + 0.2 * target_weight, 0.1, 3.0))
+
     def apply_prereq_constraint(self,
                                 theta_by_concept: dict[str, float],
                                 concept: str) -> float:
-        """Return a soft-capped ability estimate for `concept`.
-
-        If concept has prerequisites in the graph, its effective ability
-        cannot exceed min(prereq_ability) + prereq_slack.
-        """
-        raw_theta = theta_by_concept.get(concept, 0.0)
-        if concept not in self._graph:
-            return raw_theta
-        prereqs = list(self._graph.predecessors(concept))
-        if not prereqs:
-            return raw_theta
-        prereq_abilities = [theta_by_concept.get(p, 0.0) for p in prereqs]
-        cap = min(prereq_abilities) + self.prereq_slack
-        return min(raw_theta, cap)
+        """Compatibility accessor; prerequisite handling is now loss-based."""
+        return float(theta_by_concept.get(concept, 0.0))
 
     # ------------------------------------------------------------------
     # Full constrained probability
@@ -169,12 +228,12 @@ class CCMIRT:
                          d: float,
                          c_j: float,
                          concept_thetas: dict[str, float]) -> float:
-        """Apply prerequisite constraint then compute MIRT probability."""
-        dim = CONCEPT_DIM_MAP.get(concept, 0)
-        constrained_theta = theta.copy()
-        cap_val = self.apply_prereq_constraint(concept_thetas, concept)
-        constrained_theta[dim] = min(theta[dim], cap_val)
-        return self.prob(constrained_theta, a_vec, d, c_j)
+        """Compute MIRT probability; prerequisite consistency is a soft loss.
+
+        No ability estimate is hard-clipped at prediction time. Call
+        :meth:`apply_soft_prereq_penalty` after a response update instead.
+        """
+        return self.prob(theta, a_vec, d, c_j)
 
     # ------------------------------------------------------------------
     # Fisher information (for item selection)
@@ -184,12 +243,21 @@ class CCMIRT:
                     a_vec: np.ndarray,
                     d: float,
                     c_j: float = 0.25) -> np.ndarray:
-        """3×3 Fisher information matrix for one item."""
+        """3×3 Fisher information matrix for one item (canonical 3PL MIRT formula).
+
+        For the 3PL model:  P = c + (1-c) * P*
+        where P* = sigmoid(a·θ + d).
+
+        dP/dθ = (1-c) * P* * (1 - P*) * a
+        I     = (dP/dθ)² / (P * Q)   [per dimension, then outer product]
+        """
         p = self.prob(theta, a_vec, d, c_j)
-        q = 1.0 - p
-        # Guard against numerical extremes
-        pq = max(p * q, 1e-9)
-        dp_dtheta = (p - c_j) * pq / max((1.0 - c_j) ** 2, 1e-9)
-        # Information matrix I = (dP/dθ)² / (P·Q) · a·aᵀ  (scalar version per dim)
-        scale = (dp_dtheta ** 2) / pq
+        pq = max(p * (1.0 - p), 1e-9)
+        # Guessing-free sigmoid probability
+        p_star = (p - c_j) / max(1.0 - c_j, 1e-9)
+        p_star = min(max(p_star, 1e-9), 1.0 - 1e-9)
+        # Gradient of P w.r.t. θ (scalar × a_vec)
+        dp_dtheta_scale = (1.0 - c_j) * p_star * (1.0 - p_star)
+        # Information matrix: I = (dP/dθ outer dP/dθ) / (P·Q)
+        scale = (dp_dtheta_scale ** 2) / pq
         return scale * np.outer(a_vec, a_vec)

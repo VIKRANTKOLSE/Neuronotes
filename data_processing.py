@@ -13,6 +13,7 @@ import os
 import ast
 import csv
 import json
+import math
 import pandas as pd
 import networkx as nx
 from pathlib import Path
@@ -51,11 +52,14 @@ def infer_trap_weight(z_vec: list[int]) -> float:
     """Normalised entrapment weight from a 15-dim z-vector."""
     return round(sum(z_vec) / 15.0, 4)
 
-def infer_misconception_tag(concept: str, option_no: int, reason: str) -> str:
-    """Generate a deterministic misconception tag."""
-    tag_base = concept.lower().replace(" ", "_").replace("(", "").replace(")", "")
-    tag_base = "".join(c if c.isalnum() or c == "_" else "" for c in tag_base)
-    return f"{tag_base}_opt{option_no}_error"
+def infer_misconception_tag(z_vec: list[int]) -> str:
+    """Return the ontology key for an option's active z dimension.
+
+    z-vector positions are shared across the item bank, so item-local option
+    labels must never be used as misconception identifiers.
+    """
+    active = [i for i, value in enumerate(z_vec) if int(value) == 1]
+    return f"z_{active[0]:02d}" if active else "unknown_error"
 
 def infer_semantic_dimension(skill_vector: list[int]) -> str:
     """Map the first active dimension of the item's skill vector to a label."""
@@ -69,6 +73,12 @@ def infer_semantic_dimension(skill_vector: list[int]) -> str:
         if v == 1:
             return dim_labels[i]
     return "recall"
+
+
+def initial_dynamic_c(semantic_entrapment: float) -> float:
+    """Dynamic-c prior before empirical response data is available."""
+    logit = 2.0 - 1.6 * float(semantic_entrapment)
+    return round(0.25 / (1.0 + math.exp(-logit)), 4)
 
 # ---------------------------------------------------------------------------
 # 1. Load raw CSV
@@ -104,9 +114,8 @@ def build_items_clean(df: pd.DataFrame) -> pd.DataFrame:
         trap_weights = [infer_trap_weight(z) for z in wrong_zs]
         entrapment_index = round(sum(trap_weights) / len(trap_weights), 4) if trap_weights else 0.0
 
-        # Dynamic c_j
-        beta = 0.5
-        c_j  = round(0.25 * (1 - beta * entrapment_index), 4)
+        # Empirical and ambiguity terms are filled by DynamicC after attempts.
+        c_j = initial_dynamic_c(entrapment_index)
 
         records.append({
             "item_id":            row["id"],
@@ -125,6 +134,9 @@ def build_items_clean(df: pd.DataFrame) -> pd.DataFrame:
             "skill_dim2":         sv[1] if len(sv) > 1 else 0,
             "skill_dim3":         sv[2] if len(sv) > 2 else 0,
             "entrapment_index":   entrapment_index,
+            "semantic_entrapment": entrapment_index,
+            "empirical_entrapment": 0.0,
+            "ambiguity_index":    0.0,
             "c_j":                c_j,
             "estimated_time_sec": int(row["estimated_time_sec"]),
             "item_exposure_limit":int(row["item_exposure_limit"]),
@@ -162,7 +174,7 @@ def build_item_options(df: pd.DataFrame) -> pd.DataFrame:
                 error_class       = infer_error_class(reason)
                 severity          = infer_severity(error_class, z_vec)
                 trap_weight       = infer_trap_weight(z_vec)
-                misconception_tag = infer_misconception_tag(concept, opt_no, reason)
+                misconception_tag = infer_misconception_tag(z_vec)
 
             records.append({
                 "item_id":           item_id,

@@ -1,8 +1,8 @@
 """
 run_experiment.py — Master Experiment Runner
 =============================================
-Runs all 5 experimental stages (A–E) from the blueprint with
-frozen experimental conditions (seed, item bank, learner pool).
+Runs all 5 experimental stages (A–E) with completely isolated,
+leakage-free model components and reproducible synthetic learner pools.
 
 Stage A: Baselines (B1–B5)
 Stage B: Incremental Neuronotes components (P1–P7)
@@ -10,7 +10,7 @@ Stage C: Ablation study (remove one component at a time from P7)
 Stage D: Question-selection strategy comparison
 Stage E: Feedback policy comparison
 
-Returns a list of MetricBundle objects for all systems.
+Returns a list of MetricBundle objects for all evaluated systems.
 """
 
 import sys
@@ -38,7 +38,7 @@ from baselines.b4_mirt            import MIRTSelector
 from baselines.b5_kl_mirt_no_misc import KLMIRTNoMiscSelector
 
 from simulation.learner_generator import LearnerGenerator, SyntheticLearner
-from simulation.metrics           import build_metric_bundle, MetricBundle, cohens_d
+from simulation.metrics           import build_metric_bundle, MetricBundle, cohens_d, select_f1_thresholds
 
 DATA_DIR    = _CODES_DIR / "data"
 RESULTS_DIR = _CODES_DIR / "results"
@@ -57,10 +57,16 @@ RMSE_THRESHOLD  = 0.35        # for efficiency metric
 # ============================================================
 # Core simulation loop
 # ============================================================
+# Module-level stateless instance used strictly for simulate_response
+_SIMULATE_HELPER = None
+
+
 def _simulate_response(learner: SyntheticLearner, item_row, c_j: float = 0.25):
     """Call the learner generator's simulate_response using the learner's own RNG."""
-    # We can just instantiate a dummy LearnerGenerator since it only uses learner.rng
-    return LearnerGenerator(seed=0).simulate_response(learner, item_row, c_j)
+    global _SIMULATE_HELPER
+    if _SIMULATE_HELPER is None:
+        _SIMULATE_HELPER = LearnerGenerator(seed=0)
+    return _SIMULATE_HELPER.simulate_response(learner, item_row, c_j)
 
 
 def run_one_learner(learner:     SyntheticLearner,
@@ -90,9 +96,6 @@ def run_one_learner(learner:     SyntheticLearner,
     theta_trajectory     = [state.theta.copy()]
     p_correct_log        = []
     correct_log          = []
-    misc_y_true_log      = []
-    misc_y_pred_log      = []
-    misc_y_score_log     = []
 
     seen_items = set()
     active_misconception = None
@@ -139,16 +142,20 @@ def run_one_learner(learner:     SyntheticLearner,
             diag = {
                 "error_class":       "correct" if correct else "conceptual_error",
                 "misconception_tag": "none",
+                "misconception_tags": [],
+                "z_vector":          np.zeros(15),
                 "severity":          "none" if correct else "medium",
                 "is_correct":        correct,
                 "trap_weight":       0.0,
                 "rationale":         "",
             }
 
-        error_class       = diag["error_class"]
-        misconception_tag = diag["misconception_tag"]
-        severity          = diag["severity"]
-        rationale         = diag.get("rationale", "")
+        error_class        = diag["error_class"]
+        misconception_tag  = diag["misconception_tag"]
+        misconception_tags = diag.get("misconception_tags", [])
+        z_vector           = diag.get("z_vector", np.zeros(15))
+        severity           = diag["severity"]
+        rationale          = diag.get("rationale", "")
 
         # Update state
         if use_smd and updater is not None:
@@ -163,6 +170,8 @@ def run_one_learner(learner:     SyntheticLearner,
                 error_class=error_class,
                 misconception_tag=misconception_tag,
                 severity=severity,
+                z_vector=z_vector,
+                misconception_tags=misconception_tags,
             )
         else:
             # Fallback: simple gradient update (no semantic weighting)
@@ -173,19 +182,17 @@ def run_one_learner(learner:     SyntheticLearner,
             dim = CONCEPT_DIM_MAP.get(concept, 0)
             state.concept_theta[concept] = float(state.theta[dim])
 
+        # Optimize the graph penalty after the evidence update.
+        if use_prereq:
+            state.theta = mirt.apply_soft_prereq_penalty(state.theta, state.concept_theta)
+            mirt.record_prereq_observation(concept, correct)
+
+        if use_dynamic_c:
+            c_module.record_response(item_id, selected_option, correct)
+
         theta_trajectory.append(state.theta.copy())
         p_correct_log.append(p_resp)
         correct_log.append(correct)
-
-        # Misconception ground-truth detection
-        true_misc = learner.misconception_true
-        for tag in true_misc:
-            is_true_misc  = int(true_misc[tag] > 0.3)
-            is_pred_misc  = int(state.misconception.get(tag, 0.0) > 0.14)
-            score_misc    = float(state.misconception.get(tag, 0.0))
-            misc_y_true_log.append(is_true_misc)
-            misc_y_pred_log.append(is_pred_misc)
-            misc_y_score_log.append(score_misc)
 
         # Route intervention
         if use_router and router is not None and not correct:
@@ -211,18 +218,35 @@ def run_one_learner(learner:     SyntheticLearner,
         "theta_trajectory": theta_trajectory,
         "p_correct_log":    p_correct_log,
         "correct_log":      correct_log,
-        "misc_y_true":      misc_y_true_log,
-        "misc_y_pred":      misc_y_pred_log,
-        "misc_y_score":     misc_y_score_log,
+        "misc_y_true":      learner.misconception_true_vector.copy(),
+        "misc_y_score":     state.misconception_probs.copy(),
         "n_questions":      len(seen_items),
     }
 
 
 # ============================================================
-# Build system configurations
+# Leakage-Free System Factory
 # ============================================================
-def make_systems(items_path: Path, graph_path: Path) -> dict:
-    """Build all selector / component configs keyed by system name."""
+ALL_SYSTEM_NAMES = [
+    # Stage A: Baselines
+    "B1_Random", "B2_Staircase", "B3_3PL_IRT", "B4_MIRT", "B5_KL_NoMisc",
+    # Stage B: Progressive
+    "P1_MIRT_KL", "P2_CCMIRT_KL", "P3_CCMIRT_CMatrix", "P4_DynC", "P5_SMD", "P6_Router", "P7_Full_Neuronotes",
+    # Stage C: Ablations
+    "C1_NoPrereq", "C2_NoCMatrix", "C3_FixedC", "C4_NoSMD", "C5_NoRouter",
+    # Stage D: Selection Strategies
+    "D1_Random_FullPsy", "D3_MaxFisher", "D4_KL_Only", "D5_KL_Prereq", "D6_KL_Misc", "D7_KL_Full_Pen",
+    # Stage E: Feedback Policies
+    "E1_NoFeedback", "E2_GenericFeedback", "E3_ConceptFeedback", "E4_MiscFeedback", "E5_MiscPlusPrerFeedback",
+]
+
+
+def make_system(sys_name: str, items_path: Path, graph_path: Path) -> tuple:
+    """Build completely FRESH, ISOLATED components for the requested system.
+
+    Instantiating fresh components guarantees zero cross-model state leakage
+    (no shared SMD B matrix, DynamicC response history, or graph weights).
+    """
     mirt     = CCMIRT(graph_path)
     c_mat    = CMatrix()
     dyn_c    = DynamicC(items_path)
@@ -230,98 +254,127 @@ def make_systems(items_path: Path, graph_path: Path) -> dict:
     updater  = SMDVSNLMSUpdater()
     router   = InterventionRouter(graph_path)
 
-    klcat_full = KLCAT(items_path, graph_path, c_mat, mirt,
-                        use_prereq=True, use_misc=True, use_rep_pen=True)
+    # ---- Stage A: Baselines ----
+    if sys_name == "B1_Random":
+        return (RandomSelector(items_path), mirt, fixed_c, c_mat, None, None, False, False, False, False, False)
+    if sys_name == "B2_Staircase":
+        return (StaircaseSelector(items_path), mirt, fixed_c, c_mat, None, None, False, False, False, False, False)
+    if sys_name == "B3_3PL_IRT":
+        return (IRT3PLSelector(items_path), mirt, fixed_c, c_mat, None, None, False, False, False, False, False)
+    if sys_name == "B4_MIRT":
+        return (MIRTSelector(items_path), mirt, fixed_c, c_mat, None, None, False, False, False, False, False)
+    if sys_name == "B5_KL_NoMisc":
+        return (KLMIRTNoMiscSelector(items_path), mirt, fixed_c, c_mat, None, None, False, False, False, False, False)
 
-    systems = {
-        # ---- Stage A: Baselines ----
-        "B1_Random":          (RandomSelector(items_path),       mirt, fixed_c, c_mat, None,    None,   False, False, False, False, False),
-        "B2_Staircase":       (StaircaseSelector(items_path),    mirt, fixed_c, c_mat, None,    None,   False, False, False, False, False),
-        "B3_3PL_IRT":         (IRT3PLSelector(items_path),       mirt, fixed_c, c_mat, None,    None,   False, False, False, False, False),
-        "B4_MIRT":            (MIRTSelector(items_path),         mirt, fixed_c, c_mat, None,    None,   False, False, False, False, False),
-        "B5_KL_NoMisc":       (KLMIRTNoMiscSelector(items_path), mirt, fixed_c, c_mat, None,    None,   False, False, False, False, False),
+    # ---- Stage B: Progressive ----
+    if sys_name == "P1_MIRT_KL":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=fixed_c, use_prereq=False, use_misc=False, use_rep_pen=False)
+        return (sel, mirt, fixed_c, c_mat, None, None, False, False, False, False, False)
+    if sys_name == "P2_CCMIRT_KL":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=fixed_c, use_prereq=True, use_misc=False, use_rep_pen=False)
+        return (sel, mirt, fixed_c, c_mat, None, None, False, False, False, False, True)
+    if sys_name == "P3_CCMIRT_CMatrix":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=fixed_c, use_prereq=True, use_misc=True, use_rep_pen=False)
+        return (sel, mirt, fixed_c, c_mat, None, None, True, False, False, False, True)
+    if sys_name == "P4_DynC":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=False)
+        return (sel, mirt, dyn_c, c_mat, None, None, True, True, False, False, True)
+    if sys_name == "P5_SMD":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, None, True, True, True, False, True)
+    if sys_name == "P6_Router":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
+    if sys_name == "P7_Full_Neuronotes":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
 
-        # ---- Stage B: Progressive ----
-        "P1_MIRT_KL":         (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=False, use_misc=False, use_rep_pen=False),
-                               mirt, fixed_c, c_mat, None,    None,   False, False, False, False, False),
-        "P2_CCMIRT_KL":       (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=True,  use_misc=False, use_rep_pen=False),
-                               mirt, fixed_c, c_mat, None,    None,   False, False, False, False, True),
-        "P3_CCMIRT_CMatrix":  (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=True,  use_misc=True,  use_rep_pen=False),
-                               mirt, fixed_c, c_mat, None,    None,   True,  False, False, False, True),
-        "P4_DynC":            (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=True,  use_misc=True,  use_rep_pen=False),
-                               mirt, dyn_c,   c_mat, None,    None,   True,  True,  False, False, True),
-        "P5_SMD":             (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=True,  use_misc=True,  use_rep_pen=True),
-                               mirt, dyn_c,   c_mat, updater, None,   True,  True,  True,  False, True),
-        "P6_Router":          (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=True,  use_misc=True,  use_rep_pen=True),
-                               mirt, dyn_c,   c_mat, updater, router, True,  True,  True,  True,  True),
-        "P7_Full_Neuronotes": (klcat_full,
-                               mirt, dyn_c,   c_mat, updater, router, True,  True,  True,  True,  True),
+    # ---- Stage C: Ablations from P7 ----
+    if sys_name == "C1_NoPrereq":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=False, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, False)
+    if sys_name == "C2_NoCMatrix":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=False, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, router, False, True, True, True, True)
+    if sys_name == "C3_FixedC":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=fixed_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, fixed_c, c_mat, updater, router, True, False, True, True, True)
+    if sys_name == "C4_NoSMD":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, None, router, True, True, False, True, True)
+    if sys_name == "C5_NoRouter":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, None, True, True, True, False, True)
 
-        # ---- Stage C: Ablations from P7 ----
-        "C1_NoPrereq":        (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=False, use_misc=True,  use_rep_pen=True),
-                               mirt, dyn_c,   c_mat, updater, router, True,  True,  True,  True,  False),
-        "C2_NoCMatrix":       (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=True,  use_misc=False, use_rep_pen=True),
-                               mirt, dyn_c,   c_mat, updater, router, False, True,  True,  True,  True),
-        "C3_FixedC":          (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=True,  use_misc=True,  use_rep_pen=True),
-                               mirt, fixed_c, c_mat, updater, router, True,  False, True,  True,  True),
-        "C4_NoSMD":           (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=True,  use_misc=True,  use_rep_pen=True),
-                               mirt, dyn_c,   c_mat, None,    router, True,  True,  False, True,  True),
-        "C5_NoRouter":        (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=True,  use_misc=True,  use_rep_pen=True),
-                               mirt, dyn_c,   c_mat, updater, None,   True,  True,  True,  False, True),
+    # ---- Stage D: Selection strategies ----
+    if sys_name == "D1_Random_FullPsy":
+        return (RandomSelector(items_path), mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
+    if sys_name == "D3_MaxFisher":
+        return (MIRTSelector(items_path), mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
+    if sys_name == "D4_KL_Only":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=False, use_misc=False, use_rep_pen=False)
+        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, False)
+    if sys_name == "D5_KL_Prereq":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=False, use_rep_pen=False)
+        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
+    if sys_name == "D6_KL_Misc":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=False, use_misc=True, use_rep_pen=False)
+        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, False)
+    if sys_name == "D7_KL_Full_Pen":
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
 
-        # ---- Stage D: Selection strategies (share P7 psychometrics) ----
-        "D1_Random_FullPsy":  (RandomSelector(items_path),       mirt, dyn_c, c_mat, updater, router, True, True, True, True, True),
-        "D3_MaxFisher":       (MIRTSelector(items_path),          mirt, dyn_c, c_mat, updater, router, True, True, True, True, True),
-        "D4_KL_Only":         (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=False, use_misc=False, use_rep_pen=False),
-                               mirt, dyn_c, c_mat, updater, router, True, True, True, True, False),
-        "D5_KL_Prereq":       (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=True, use_misc=False, use_rep_pen=False),
-                               mirt, dyn_c, c_mat, updater, router, True, True, True, True, True),
-        "D6_KL_Misc":         (KLCAT(items_path, graph_path, c_mat, mirt, use_prereq=False, use_misc=True, use_rep_pen=False),
-                               mirt, dyn_c, c_mat, updater, router, True, True, True, True, False),
-        "D7_KL_Full_Pen":     (klcat_full, mirt, dyn_c, c_mat, updater, router, True, True, True, True, True),
+    # ---- Stage E: Feedback policies ----
+    if sys_name in {"E1_NoFeedback", "E2_GenericFeedback", "E3_ConceptFeedback", "E4_MiscFeedback", "E5_MiscPlusPrerFeedback"}:
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        use_rt = (sys_name != "E1_NoFeedback")
+        rt_obj = router if use_rt else None
+        return (sel, mirt, dyn_c, c_mat, updater, rt_obj, True, True, True, use_rt, True)
 
-        # ---- Stage E: Feedback policies (share P7 selector + psychometrics) ----
-        "E1_NoFeedback":      (klcat_full, mirt, dyn_c, c_mat, updater, None,   True, True, True, False, True),
-        "E2_GenericFeedback": (klcat_full, mirt, dyn_c, c_mat, updater, router, True, True, True, True,  True),
-    }
-    # E2–E5 all use the same router but vary intervention depth via router config
-    # (For simplicity in simulation, we treat E2–E5 as router=True with full P7)
-    systems["E3_ConceptFeedback"]   = systems["E2_GenericFeedback"]
-    systems["E4_MiscFeedback"]      = systems["E2_GenericFeedback"]
-    systems["E5_MiscPlusPrerFeedback"] = systems["P7_Full_Neuronotes"]
-
-    return systems
+    raise ValueError(f"Unknown system name: {sys_name}")
 
 
 # ============================================================
 # Run all stages
 # ============================================================
 def run_all_stages(n_learners: int = N_LEARNERS,
-                   seed: int = MASTER_SEED) -> list[MetricBundle]:
+                   seed: int = MASTER_SEED,
+                   systems_to_run: Optional[list[str]] = None) -> list[MetricBundle]:
+    """Execute evaluation for all requested systems.
+
+    Guarantees:
+      1. Every system receives fresh, isolated components (zero state leakage).
+      2. Every system faces an identical synthetic learner pool (identically seeded).
+    """
     print(f"\n{'='*60}")
     print(" Neuronotes Experiment Runner")
     print(f" N_learners={n_learners}, seed={seed}, max_q={MAX_QUESTIONS}")
     print(f"{'='*60}\n")
-    print("============================================================")
 
     items_path = DATA_DIR / "items_clean.csv"
     graph_path = DATA_DIR / "concept_graph.csv"
 
-    # Generate frozen learner pool
-    print("Generating learner pool ...")
-    gen     = LearnerGenerator(n_learners=n_learners, seed=seed)
-    learners = gen.generate()
-    print("  >> {} learners generated".format(len(learners)))
+    if systems_to_run is None:
+        target_systems = ALL_SYSTEM_NAMES
+    else:
+        missing = sorted(set(systems_to_run) - set(ALL_SYSTEM_NAMES))
+        if missing:
+            raise ValueError(f"Unknown system names: {', '.join(missing)}")
+        target_systems = systems_to_run
 
-    # Build all systems
-    systems = make_systems(items_path, graph_path)
     bundles: list[MetricBundle] = []
 
-    for sys_name, config in systems.items():
+    for sys_name in target_systems:
+        # Build fresh, isolated system
+        config = make_system(sys_name, items_path, graph_path)
         (selector, mirt_, c_mod, c_mat_, updater_,
          router_, use_cmat, use_dynC, use_smd, use_rt, use_pre) = config
 
-        print(f"\n[{sys_name}] running {n_learners} learners ...")
+        # Generate fresh, identically-seeded learner population for each model
+        gen = LearnerGenerator(n_learners=n_learners, seed=seed)
+        learners = gen.generate()
+
+        print(f"[{sys_name}] running {n_learners} learners (seed={seed}) ...")
         selector.reset_exposure()
 
         results = []
@@ -342,19 +395,28 @@ def run_all_stages(n_learners: int = N_LEARNERS,
             )
             results.append(res)
 
+        # Thresholds selected on held-out validation partition (1/4 of pool)
+        validation_count   = max(1, len(results) // 4)
+        validation_results = results[:validation_count]
+        test_results       = results[validation_count:]
+        thresholds = select_f1_thresholds(
+            np.asarray([r["misc_y_true"] for r in validation_results]),
+            np.asarray([r["misc_y_score"] for r in validation_results]),
+        )
         bundle = build_metric_bundle(
             system_name=sys_name,
-            theta_true_list=[r["theta_true"] for r in results],
-            theta_final_list=[r["theta_final"] for r in results],
-            theta_est_trajectories=[r["theta_trajectory"] for r in results],
-            p_correct_all=[p for r in results for p in r["p_correct_log"]],
-            correct_all=[c for r in results for c in r["correct_log"]],
-            misc_y_true=[y for r in results for y in r["misc_y_true"]],
-            misc_y_pred=[y for r in results for y in r["misc_y_pred"]],
-            misc_y_score=[y for r in results for y in r["misc_y_score"]],
+            theta_true_list=[r["theta_true"] for r in test_results],
+            theta_final_list=[r["theta_final"] for r in test_results],
+            theta_est_trajectories=[r["theta_trajectory"] for r in test_results],
+            p_correct_all=[p for r in test_results for p in r["p_correct_log"]],
+            correct_all=[c for r in test_results for c in r["correct_log"]],
+            misc_y_true=[r["misc_y_true"] for r in test_results],
+            misc_y_score=[r["misc_y_score"] for r in test_results],
+            misc_thresholds=thresholds,
+            rmse_threshold=RMSE_THRESHOLD,
         )
-        print(f"  RMSE={bundle.rmse:.4f}  F1={bundle.f1:.4f}  "
-              f"EffQ={bundle.efficiency_q:.1f}")
+        print(f"  -> RMSE={bundle.rmse:.4f}  MAE={bundle.mae:.4f}  ECE={bundle.ece:.4f}  "
+              f"F1={bundle.f1:.4f}  AUROC={bundle.auroc:.4f}  EffQ={bundle.efficiency_q:.1f}")
         bundles.append(bundle)
 
     return bundles
@@ -381,6 +443,8 @@ def save_results(bundles: list[MetricBundle]):
             "recall":         round(b.recall, 4),
             "f1":             round(b.f1, 4),
             "auroc":          round(b.auroc, 4),
+            "auroc_micro":    round(b.auroc_micro, 4),
+            "valid_misconception_dims": b.valid_misconception_dims,
             "efficiency_q":   round(b.efficiency_q, 2),
         })
     df = pd.DataFrame(rows)

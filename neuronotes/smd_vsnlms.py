@@ -1,157 +1,170 @@
-"""
-smd_vsnlms.py — Semantic Variable-Step Normalized LMS Updater with Momentum
-============================================================================
-Module 4 of SMD-CC-MIRT-KL-CAT
+"""Semantic variable-step normalized LMS updates backed by the z ontology.
 
-Updates the learner's 3D ability vector (θ) and per-misconception state
-after each response, using a step size that varies with:
-  - error_class  (conceptual > arithmetic > slip)
-  - repetition   (momentum boosts confidence on repeated errors)
+For a response to option k of item j, the update is:
 
-Update rule
------------
-    gradient  = (correct - P_pred) * a_vec      (NLMS step)
-    μ_eff     = base_lr * class_scale * momentum_factor / norm(a_vec)
-    θ_new     = θ + μ_eff * gradient
+``delta_theta = eta * (residual * a_j + alpha * B @ z_jk) + mu * delta_prev``
 
-Misconception state update
---------------------------
-    For each active misconception: state[tag] += δ (exponential decay on correct)
+``B`` is a 3-by-15 learnable semantic mapping. It starts from a small,
+deterministic prior and is updated online from response residuals.
 """
 
-import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
 
-# Step-size multipliers per error class
+import numpy as np
+
 ERROR_CLASS_SCALE = {
-    "correct":           0.0,   # no misconception update on correct answer
-    "conceptual_error":  1.0,   # full update
-    "arithmetic_error":  0.4,   # smaller – don't penalise ability heavily
-    "slip":              0.1,   # very small – likely one-off
-    "unknown_error":     0.6,
+    "correct": 0.0,
+    "conceptual_error": 1.0,
+    "arithmetic_error": 0.4,
+    "slip": 0.1,
+    "unknown_error": 0.6,
 }
 
-BASE_LR          = 0.15   # learning rate for ability update
-MOMENTUM_MAX     = 2.0    # maximum momentum multiplier
-MOMENTUM_DECAY   = 0.8    # momentum decays each step (on correct answer)
-MISC_STRENGTH    = 0.15   # misconception state increment per wrong response
-MISC_DECAY       = 0.05   # misconception state decay per correct response
+BASE_LR = 0.15
+MOMENTUM_MAX = 2.0
+MOMENTUM_DECAY = 0.8
+MISC_STRENGTH = 0.15
+MISC_DECAY = 0.05
+N_SEMANTIC_DIMS = 15
 
 
 @dataclass
 class LearnerState:
-    """Mutable state for one simulated learner during a test session."""
-    theta:            np.ndarray = field(default_factory=lambda: np.zeros(3))
-    # concept_theta: per-concept ability (for prerequisite checks)
-    concept_theta:    dict       = field(default_factory=dict)
-    # misconception strengths: tag → float in [0, 1]
-    misconception:    dict       = field(default_factory=dict)
-    # per-misconception repeat counter for momentum
-    repeat_count:     dict       = field(default_factory=dict)
-    # full response history
-    response_history: list       = field(default_factory=list)
+    theta: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    concept_theta: dict = field(default_factory=dict)
+    misconception: dict = field(default_factory=dict)
+    # Continuous posterior-like evidence for every shared ontology slot.
+    # This is the score used for AUROC; the dict above is retained for routing.
+    misconception_probs: np.ndarray = field(
+        default_factory=lambda: np.full(N_SEMANTIC_DIMS, 0.10, dtype=float)
+    )
+    repeat_count: dict = field(default_factory=dict)
+    response_history: list = field(default_factory=list)
+    previous_delta: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
 
 class SMDVSNLMSUpdater:
-    """Semantic Variable-Step Normalized LMS updater.
-
-    Parameters
-    ----------
-    base_lr : float
-        Base learning rate μ₀.
-    momentum_max : float
-        Maximum momentum multiplier (caps repeated-error boost).
-    """
+    """Update learner state using both MIRT residual and z-vector evidence."""
 
     def __init__(self,
-                 base_lr:      float = BASE_LR,
-                 momentum_max: float = MOMENTUM_MAX):
-        self.base_lr      = base_lr
+                 base_lr: float = BASE_LR,
+                 momentum_max: float = MOMENTUM_MAX,
+                 semantic_alpha: float = 0.35,
+                 semantic_matrix_lr: float = 0.02,
+                 momentum: float = 0.2,
+                 semantic_matrix: Optional[np.ndarray] = None):
+        self.base_lr = base_lr
         self.momentum_max = momentum_max
+        self.semantic_alpha = semantic_alpha
+        self.semantic_matrix_lr = semantic_matrix_lr
+        self.momentum = momentum
+        if semantic_matrix is None:
+            # Weak prior: every shared ontology slot initially maps to one
+            # ability axis; observations refine these values online.
+            self.B = np.zeros((3, N_SEMANTIC_DIMS), dtype=float)
+            self.B[np.arange(N_SEMANTIC_DIMS) % 3, np.arange(N_SEMANTIC_DIMS)] = -0.05
+        else:
+            matrix = np.asarray(semantic_matrix, dtype=float)
+            if matrix.shape != (3, N_SEMANTIC_DIMS):
+                raise ValueError("semantic_matrix must have shape (3, 15)")
+            self.B = matrix.copy()
 
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _z_vector(z_vector: Optional[np.ndarray]) -> np.ndarray:
+        if z_vector is None:
+            return np.zeros(N_SEMANTIC_DIMS, dtype=float)
+        vector = np.asarray(z_vector, dtype=float).reshape(-1)
+        return np.pad(vector[:N_SEMANTIC_DIMS], (0, max(0, N_SEMANTIC_DIMS - len(vector))))
+
+    @staticmethod
+    def _tags(misconception_tag: str, misconception_tags: Optional[list[str]], z_vector: np.ndarray) -> list[str]:
+        if misconception_tags:
+            return [tag for tag in misconception_tags if tag not in {"none", "unknown_error"}]
+        if misconception_tag not in {"none", "unknown_error"}:
+            return [misconception_tag]
+        return [f"z_{index:02d}" for index, value in enumerate(z_vector) if value > 0]
+
     def update(self,
-               state:      LearnerState,
-               item_id:    str,
-               concept:    str,
-               a_vec:      np.ndarray,
-               d_param:    float,
-               p_correct:  float,
-               correct:    bool,
+               state: LearnerState,
+               item_id: str,
+               concept: str,
+               a_vec: np.ndarray,
+               d_param: float,
+               p_correct: float,
+               correct: bool,
                error_class: str,
                misconception_tag: str,
-               severity:   str = "medium") -> LearnerState:
-        """Apply one SMD-VSNLMS update step.
+               severity: str = "medium",
+               z_vector: Optional[np.ndarray] = None,
+               misconception_tags: Optional[list[str]] = None) -> LearnerState:
+        """Apply one ontology-aware SMD-VSNLMS update in place."""
+        del d_param  # retained in the public API for backwards compatibility
+        z = self._z_vector(z_vector)
+        tags = self._tags(misconception_tag, misconception_tags, z)
+        residual = (1 if correct else 0) - p_correct
+        class_scale = 1.0 if correct else ERROR_CLASS_SCALE.get(error_class, 0.5)
 
-        Parameters
-        ----------
-        state          : current LearnerState (mutated in-place)
-        item_id        : item identifier (for logging)
-        concept        : chemistry concept name
-        a_vec          : discrimination vector (3-dim)
-        d_param        : difficulty
-        p_correct      : predicted probability of correct response
-        correct        : whether learner answered correctly
-        error_class    : 'correct','conceptual_error','arithmetic_error','slip'
-        misconception_tag : tag from C-Matrix
-        severity       : 'high','medium','low'
-        """
-        response_val = 1 if correct else 0
-        residual     = response_val - p_correct
+        repetition = 1.0
+        if not correct:
+            for tag in tags:
+                count = state.repeat_count.get(tag, 0) + 1
+                state.repeat_count[tag] = count
+                repetition = max(repetition, min(1.0 + 0.3 * (count - 1), self.momentum_max))
+        else:
+            for tag in tags:
+                state.repeat_count[tag] = max(0, state.repeat_count.get(tag, 0) - 1)
 
-        # Determine class-based step scale
-        # Use full step for correct answers, otherwise scale by error type
-        ec_scale = 1.0 if correct else ERROR_CLASS_SCALE.get(error_class, 0.5)
+        eta = self.base_lr * class_scale * repetition / max(np.linalg.norm(a_vec), 1e-6)
+        semantic_term = np.zeros(3) if correct else self.semantic_alpha * (self.B @ z)
+        delta = eta * (residual * a_vec + semantic_term) + self.momentum * state.previous_delta
+        state.theta = np.clip(state.theta + delta, -4.0, 4.0)
+        state.previous_delta = delta
 
-        # Compute momentum multiplier for repeated misconceptions
-        momentum = 1.0
-        if not correct and misconception_tag != "none":
-            cnt = state.repeat_count.get(misconception_tag, 0) + 1
-            state.repeat_count[misconception_tag] = cnt
-            momentum = min(1.0 + 0.3 * (cnt - 1), self.momentum_max)
-        elif correct and misconception_tag != "none":
-            state.repeat_count[misconception_tag] = max(
-                0, state.repeat_count.get(misconception_tag, 0) - 1
-            )
+        # Update B only when a misconception vector is actually observed.
+        if not correct and np.any(z):
+            self.B += self.semantic_matrix_lr * np.outer(residual * a_vec, z)
+            self.B = np.clip(self.B, -1.0, 1.0)
 
-        # Effective step size (normalised by ||a||)
-        a_norm = max(np.linalg.norm(a_vec), 1e-6)
-        mu_eff = self.base_lr * ec_scale * momentum / a_norm
-
-        # Ability update: θ ← θ + μ * residual * a
-        state.theta = state.theta + mu_eff * residual * a_vec
-        state.theta = np.clip(state.theta, -4.0, 4.0)
-
-        # Per-concept ability: update the primary dimension's concept estimate
         from .cc_mirt import CONCEPT_DIM_MAP
         dim = CONCEPT_DIM_MAP.get(concept, 0)
         state.concept_theta[concept] = float(state.theta[dim])
 
-        # Misconception state update
-        if not correct and misconception_tag and misconception_tag != "none":
-            sev_scale = {"high": 1.2, "medium": 1.0, "low": 0.6}.get(severity, 1.0)
-            state.misconception[misconception_tag] = min(
-                1.0,
-                state.misconception.get(misconception_tag, 0.0) + MISC_STRENGTH * sev_scale
-            )
-        elif correct and misconception_tag and misconception_tag != "none":
-            # Correct answer provides weak evidence against the misconception
-            state.misconception[misconception_tag] = max(
-                0.0,
-                state.misconception.get(misconception_tag, 0.0) - MISC_DECAY
-            )
+        # Continuous misconception evidence. A wrong distractor is positive
+        # evidence only for the ontology slots it activates; a correct answer
+        # supplies weak negative evidence across the current posterior rather
+        # than turning any diagnosis into a binary label.
+        if correct:
+            state.misconception_probs *= (1.0 - MISC_DECAY)
+        elif np.any(z):
+            severity_scale = {"high": 1.2, "medium": 1.0, "low": 0.6}.get(severity, 1.0)
+            update_rate = MISC_STRENGTH * severity_scale
+            state.misconception_probs += update_rate * z * (1.0 - state.misconception_probs)
+        state.misconception_probs = np.clip(state.misconception_probs, 0.001, 0.999)
 
-        # Log response
+        if not correct:
+            severity_scale = {"high": 1.2, "medium": 1.0, "low": 0.6}.get(severity, 1.0)
+            for tag in tags:
+                index = int(tag.split("_")[-1]) if tag.startswith("z_") else None
+                value = state.misconception_probs[index] if index is not None else 0.0
+                state.misconception[tag] = float(value)
+        elif tags:
+            for tag in tags:
+                index = int(tag.split("_")[-1]) if tag.startswith("z_") else None
+                value = state.misconception_probs[index] if index is not None else 0.0
+                state.misconception[tag] = float(value)
+
         state.response_history.append({
-            "item_id":          item_id,
-            "concept":          concept,
-            "correct":          correct,
-            "error_class":      error_class,
-            "misconception_tag": misconception_tag,
-            "theta_after":      state.theta.tolist(),
-            "mu_eff":           round(mu_eff, 5),
-            "momentum":         round(momentum, 3),
+            "item_id": item_id,
+            "concept": concept,
+            "correct": correct,
+            "error_class": error_class,
+            "misconception_tags": tags,
+            "z_vector": z.tolist(),
+            "misconception_probs": state.misconception_probs.tolist(),
+            "theta_after": state.theta.tolist(),
+            "delta_theta": delta.tolist(),
+            "eta": round(eta, 5),
+            "repetition": round(repetition, 3),
         })
-
         return state

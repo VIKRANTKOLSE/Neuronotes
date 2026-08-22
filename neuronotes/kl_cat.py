@@ -26,6 +26,8 @@ from scipy.stats import multivariate_normal
 
 from .cc_mirt  import CCMIRT, CONCEPT_DIM_MAP
 from .c_matrix import CMatrix
+from .t_matrix import ColdStartRouter
+from .dynamic_c import DynamicC
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
@@ -48,6 +50,7 @@ class KLCAT:
     concept_graph_path : Path, optional
     c_matrix : CMatrix, optional
     mirt : CCMIRT, optional
+    dynamic_c : DynamicC, optional — dynamic guessing floor provider
     weights : dict, optional  keys: kl, prereq, misc, rep
     use_prereq  : bool  — enable prerequisite relevance bonus
     use_misc    : bool  — enable misconception diagnostic bonus
@@ -59,15 +62,20 @@ class KLCAT:
                  concept_graph_path: Optional[Path] = None,
                  c_matrix:   Optional[CMatrix] = None,
                  mirt:       Optional[CCMIRT]  = None,
+                 dynamic_c:  Optional[DynamicC] = None,
                  weights:    Optional[dict]    = None,
                  use_prereq:  bool = True,
                  use_misc:    bool = True,
-                 use_rep_pen: bool = True):
-        self.mirt    = mirt  or CCMIRT(concept_graph_path)
-        self.c_mat   = c_matrix or CMatrix()
+                 use_rep_pen: bool = True,
+                 use_cold_start: bool = True):
+        self.mirt       = mirt or CCMIRT(concept_graph_path)
+        self.c_mat      = c_matrix or CMatrix()
+        self.dynamic_c  = dynamic_c
         self.use_prereq  = use_prereq
         self.use_misc    = use_misc
         self.use_rep_pen = use_rep_pen
+        self.use_cold_start = use_cold_start
+        self.cold_start = ColdStartRouter(concept_graph_path)
 
         w = weights or {}
         self.w_kl  = w.get("kl",    W_KL)
@@ -164,7 +172,10 @@ class KLCAT:
         # ---- Vectorised KL gain ----
         A = candidates[["a1", "a2", "a3"]].values          # (N, 3)
         D = candidates["d_param"].values                    # (N,)
-        C = candidates["c_j"].values                        # (N,)
+        if self.dynamic_c is not None:
+            C = np.array([self.dynamic_c.get(str(iid)) for iid in candidates["item_id"].values], dtype=float)
+        else:
+            C = candidates["c_j"].values.astype(float)      # (N,)
 
         logits  = A @ theta + D                             # (N,)
         p_star  = 1.0 / (1.0 + np.exp(-logits))
@@ -221,9 +232,16 @@ class KLCAT:
         else:
             rep = np.zeros(len(candidates))
 
+        # ---- Cold-start routing (only before any response evidence) ----
+        cold = np.zeros(len(candidates))
+        if self.use_cold_start and not seen_items:
+            target_concept = self.cold_start.recommend_concept(set())
+            if target_concept:
+                cold = (candidates["concept"].values == target_concept).astype(float)
+
         # ---- Combined utility ----
         scores   = (self.w_kl * kl_gain + self.w_pre * pre
-                    + self.w_mis * mis - self.w_rep * rep)
+                    + self.w_mis * mis - self.w_rep * rep + 0.5 * cold)
         best_idx = int(np.argmax(scores))
         best_row = candidates.iloc[best_idx]
 

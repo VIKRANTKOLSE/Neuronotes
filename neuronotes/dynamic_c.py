@@ -1,92 +1,134 @@
-"""
-dynamic_c.py — Dynamic Guessing Parameter
-==========================================
-Module 3 of SMD-CC-MIRT-KL-CAT
+"""Adaptive, log-calibrated guessing parameters.
 
-Replaces the fixed c = 0.25 with an item-specific value:
+``c_j = 0.25 * sigmoid(beta0 + beta_sem*E_semantic +
+                         beta_emp*E_empirical - beta_amb*E_ambiguity)``
 
-    c_j = 0.25 * (1 - β * E_j)
-
-where E_j is the Entrapment Index of item j (pre-computed and stored in
-items_clean.csv) and β ∈ [0, 1] controls how much attractive distractors
-suppress the guessing floor.
-
-Intuition:
-  - E_j near 0  → options are not enticing → guessing floor stays at 0.25
-  - E_j near 1  → all distractors are highly trapping → c_j drops toward 0
-                  (a random guesser is unlikely to pick correctly because
-                   distractors are very attractive)
+The semantic component is available at import time from the z-ontology.
+Empirical entrapment and wrong-option ambiguity are estimated periodically
+from accumulated response logs.
 """
 
-import numpy as np
-import pandas as pd
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+import pandas as pd
+
 DATA_DIR = Path(__file__).parent.parent / "data"
-DEFAULT_BETA = 0.5      # recommended β per blueprint
+DEFAULT_COEFFICIENTS = {
+    "intercept": 2.0,
+    "semantic": -1.6,
+    "empirical": -1.2,
+    "ambiguity": 0.8,
+}
 
 
 class DynamicC:
-    """Computes item-specific guessing parameters c_j.
-
-    Parameters
-    ----------
-    items_clean_path : Path, optional
-        Path to items_clean.csv. Defaults to data/items_clean.csv.
-    beta : float
-        Sensitivity parameter β ∈ [0, 1].
-    """
+    """Compute and periodically recalibrate item-specific guessing floors."""
 
     def __init__(self,
                  items_clean_path: Optional[Path] = None,
-                 beta: float = DEFAULT_BETA):
-        self.beta = beta
+                 coefficients: Optional[dict] = None,
+                 recalibration_interval: int = 100):
+        self.coefficients = {**DEFAULT_COEFFICIENTS, **(coefficients or {})}
+        self.recalibration_interval = max(1, int(recalibration_interval))
         self._c_map: dict[str, float] = {}
-        p = items_clean_path or (DATA_DIR / "items_clean.csv")
-        if p.exists():
-            self._load(p)
+        self._item_features: dict[str, dict[str, float]] = {}
+        self._attempt_log: list[dict] = []
+        self._attempt_stats: dict[str, dict] = {}
+        self._dirty_items: set[str] = set()
+        path = items_clean_path or DATA_DIR / "items_clean.csv"
+        if path.exists():
+            self._load(path)
 
-    def _load(self, path: Path):
+    def _load(self, path: Path) -> None:
         df = pd.read_csv(path)
         for _, row in df.iterrows():
-            # items_clean already stores pre-computed c_j
-            self._c_map[str(row["item_id"])] = float(row["c_j"])
+            item_id = str(row["item_id"])
+            semantic = float(row.get("semantic_entrapment", row.get("entrapment_index", 0.0)))
+            features = {"semantic": semantic, "empirical": 0.0, "ambiguity": 0.0}
+            self._item_features[item_id] = features
+            self._c_map[item_id] = self._compute(**features)
 
-    # ------------------------------------------------------------------
     def get(self, item_id: str, entrapment_index: Optional[float] = None) -> float:
-        """Return c_j for an item.
-
-        Falls back to formula if item_id not in table.
-
-        Parameters
-        ----------
-        item_id : str
-        entrapment_index : float, optional
-            Used only if item_id is not found in precomputed table.
-        """
         if item_id in self._c_map:
             return self._c_map[item_id]
         if entrapment_index is not None:
-            return self._compute(entrapment_index)
-        return 0.25  # default fixed guessing
+            return self._compute(float(entrapment_index), 0.0, 0.0)
+        return 0.25
 
-    def _compute(self, e_j: float) -> float:
-        """c_j = 0.25 * (1 - β * E_j), clipped to [0.01, 0.25]."""
-        c = 0.25 * (1.0 - self.beta * float(e_j))
-        return float(np.clip(c, 0.01, 0.25))
+    def _compute(self, semantic: float, empirical: float, ambiguity: float) -> float:
+        b = self.coefficients
+        logit = (b["intercept"] + b["semantic"] * float(semantic)
+                 + b["empirical"] * float(empirical)
+                 + b["ambiguity"] * float(ambiguity))
+        return float(np.clip(0.25 / (1.0 + np.exp(-logit)), 0.01, 0.25))
 
-    # ------------------------------------------------------------------
-    def update_beta(self, beta: float):
-        """Update β and recompute all c_j values."""
-        self.beta = float(np.clip(beta, 0.0, 1.0))
+    def record_response(self, item_id: str, selected_option: int, correct: bool) -> None:
+        """Record one attempt in O(1) and periodically refresh changed items."""
+        item_id = str(item_id)
+        record = {"item_id": item_id, "option": int(selected_option), "correct": bool(correct)}
+        self._attempt_log.append(record)
+        stats = self._attempt_stats.setdefault(item_id, {"total": 0, "incorrect": 0, "options": {}})
+        stats["total"] += 1
+        if not correct:
+            stats["incorrect"] += 1
+            stats["options"][int(selected_option)] = stats["options"].get(int(selected_option), 0) + 1
+        self._dirty_items.add(item_id)
+        if len(self._attempt_log) % self.recalibration_interval == 0:
+            self.recalibrate()
+
+    def recalibrate(self, attempts: Optional[list[dict]] = None) -> None:
+        """Update empirical and ambiguity features from response logs.
+
+        Empirical entrapment is the observed incorrect-response rate.
+        Ambiguity is normalized entropy over incorrect option choices.
+        """
+        if attempts is not None:
+            stats_by_item: dict[str, dict] = {}
+            for attempt in attempts:
+                item_id = str(attempt["item_id"])
+                stats = stats_by_item.setdefault(item_id, {"total": 0, "incorrect": 0, "options": {}})
+                stats["total"] += 1
+                if not bool(attempt["correct"]):
+                    stats["incorrect"] += 1
+                    option = int(attempt["option"])
+                    stats["options"][option] = stats["options"].get(option, 0) + 1
+            items_to_refresh = stats_by_item.items()
+        else:
+            items_to_refresh = ((item_id, self._attempt_stats[item_id]) for item_id in self._dirty_items)
+
+        for item_id, stats in items_to_refresh:
+            if item_id not in self._item_features:
+                continue
+            empirical = float(stats["incorrect"] / max(stats["total"], 1))
+            if stats["incorrect"] > 1:
+                probabilities = np.asarray(list(stats["options"].values()), dtype=float) / stats["incorrect"]
+                ambiguity = float(-(probabilities * np.log(probabilities)).sum() / np.log(3))
+            else:
+                ambiguity = 0.0
+            features = self._item_features[item_id]
+            features.update({"empirical": empirical, "ambiguity": ambiguity})
+            self._c_map[item_id] = self._compute(**features)
+        if attempts is None:
+            self._dirty_items.clear()
+
+    def update_coefficients(self, coefficients: dict) -> None:
+        """Apply newly fitted coefficients and refresh all loaded items."""
+        self.coefficients.update({key: float(value) for key, value in coefficients.items()})
+        for item_id, features in self._item_features.items():
+            self._c_map[item_id] = self._compute(**features)
 
     @staticmethod
     def fixed(value: float = 0.25) -> "DynamicC":
-        """Return a DynamicC instance that always returns a fixed c."""
+        """Return a minimal module that always serves the requested constant."""
         obj = DynamicC.__new__(DynamicC)
-        obj.beta     = 0.0
-        obj._c_map   = {}
-        obj._fixed   = float(value)
-        obj.get      = lambda item_id, entrapment_index=None: obj._fixed  # type: ignore
+        obj.coefficients = DEFAULT_COEFFICIENTS.copy()
+        obj._c_map = {}
+        obj._item_features = {}
+        obj._attempt_log = []
+        obj._attempt_stats = {}
+        obj._dirty_items = set()
+        obj._fixed = float(value)
+        obj.get = lambda item_id, entrapment_index=None: obj._fixed  # type: ignore
         return obj
