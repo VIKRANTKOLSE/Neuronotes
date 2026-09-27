@@ -4,91 +4,117 @@ cc_mirt.py — Chemically Constrained Multidimensional Item Response Theory
 Module 1 of SMD-CC-MIRT-KL-CAT
 
 Key design:
-  - 3-dimensional ability vector θ = [θ1, θ2, θ3]
+  - 58-dimensional ability vector θ (one dimension per Q-matrix concept node)
   - MIRT response probability: P(correct | θ, item) via compensatory model
       P = c_j + (1 - c_j) / (1 + exp(-a·θ - d))
   - Prerequisite soft constraint: if concept B requires concept A,
     cap θ_B ≤ θ_A + PREREQ_SLACK so implausible states are penalised.
-  - Concept-to-dimension mapping: each concept maps to one primary skill
-    dimension (θ1=foundational, θ2=periodic/bonding, θ3=coordination/advanced)
+  - CONCEPT_DIM_MAP: each concept maps to its primary Q-matrix dimension
 """
 
+import math
+import json
 import numpy as np
 import pandas as pd
 import networkx as nx
 from pathlib import Path
 from typing import Optional
 
-DATA_DIR   = Path(__file__).parent.parent / "data"
+DATA_DIR     = Path(__file__).parent.parent / "data"
 PREREQ_SLACK = 0.5          # max advantage a child concept can have over its prereq
-N_DIMS       = 3
+N_DIMS       = 58           # one dimension per Q-matrix concept node
 
-# Concept → primary dimension mapping
+# Concept → primary Q-matrix dimension mapping
+# Computed from the questions_final_qmatrix.csv a_vector loadings
 CONCEPT_DIM_MAP = {
-    # Dim 0: Foundational atomic structure
     "Effective Nuclear Charge":                     0,
-    "Shielding Effect":                             0,
-    "Orbital Penetration":                          0,
-    "Electron-Electron Repulsion":                  0,
-    "Energy Level Splitting in Atomic Orbitals":    0,
-    "Exchange Energy and Half-Filled Shell Stability": 0,
-    # Dim 1: Periodic trends & bonding
-    "Atomic Radius Trend":                          1,
-    "Ionization Enthalpy Trend":                    1,
-    "Third Ionization Enthalpy Anomalies":          1,
-    "Electron Gain Enthalpy Trend":                 1,
-    "Electronegativity Trend":                      1,
-    "Charge Density (Z/r) and Ionic Potential":     1,
-    "Lattice Energy":                               1,
-    "Polarization Effects (Fajan's Rule + Polarizing Power)": 1,
-    "Inert Pair Effect":                            1,
-    "Diagonal Relationship":                        1,
-    "Sigma and Pi Bonding in Molecular Orbitals":   1,
-    "Hybridization and Orbital Mixing Principles":  1,
-    "Valence Shell Electron Pair Repulsion Theory": 1,
-    "VSEPR Application to Hypervalent Molecules":   1,
-    "VSEPR Hypervalent Geometry":                   1,
-    "Bent's Rule":                                  1,
-    "Dipole Moment and Molecular Polarity":         1,
-    "Hydrogen Bonding":                             1,
-    "Molecular Orbital Theory and Delocalization":  1,
-    "Back Bonding":                                 1,
-    "Electron-Deficient Bonding in Boranes":        1,
-    "Oxoacid Strength and Basicity from Structure": 1,
-    "Noble Gas Compound Stability":                 1,
-    "Polymerization of Silicate Units":             1,
-    "Thermal Stability from Lattice Energy and Polarization": 1,
-    "Redox Stability and Disproportionation Tendencies": 1,
-    "Solubility Product and Precipitation Logic":   1,
-    "HSAB Principle":                               1,
-    "Hard and Soft Acids and Bases (HSAB) Principle": 1,
-    # Dim 2: Coordination / d-block / advanced
-    "Coordination Number and Geometry Relationships": 2,
-    "Ligand Denticity and Polydentate Binding":     2,
-    "Chelate Effect":                               2,
-    "Metal-Ligand Bonding (σ and π interactions in complexes)": 2,
-    "Crystal Field Splitting in Octahedral Field":  2,
-    "Crystal Field Splitting in Tetrahedral Field": 2,
-    "Crystal Field Stabilization Energy":           2,
-    "High-Spin vs Low-Spin Complexes":              2,
-    "Spectrochemical Series":                       2,
-    "Jahn-Teller Distortion":                       2,
-    "Ligand Field Theory":                          2,
-    "t2g Orbital Pi Bonding":                       2,
-    "Magnetic Properties from Unpaired d-electrons": 2,
-    "Color Origin in Coordination Compounds":       2,
-    "Stability Constants of Complexes":             2,
-    "Geometric Isomerism in Coordination Compounds": 2,
-    "Optical Isomerism in Coordination Compounds":  2,
-    "Linkage Isomerism":                            2,
-    "Variable Oxidation State Stability in d-block": 2,
-    "Standard Electrode Potential Trends in d-block": 2,
-    "Lanthanoid Contraction":                       2,
-    "Actinoid Contraction":                         2,
-    "4d and 5d Series Similarity Post-Lanthanoid Contraction": 2,
-    "Ellingham Diagram and Thermodynamic Feasibility": 2,
-    "Electrochemical Reduction Principles in Metallurgy": 2,
+    "Shielding Effect":                             1,
+    "Orbital Penetration":                          2,
+    "Electron-Electron Repulsion":                  3,
+    "Energy Level Splitting in Atomic Orbitals":    4,
+    "Charge Density (Z/r) and Ionic Potential":     5,
+    "Lattice Energy":                               6,
+    "Sigma and Pi Bonding in Molecular Orbitals":   9,
+    "Atomic Radius Trend":                          10,
+    "Ionization Enthalpy Trend":                    11,
+    "Electron Gain Enthalpy Trend":                 12,
+    "Electronegativity Trend":                      13,
+    "Dipole Moment and Molecular Polarity":         14,
+    "Valence Shell Electron Pair Repulsion Theory": 15,
+    "Hybridization and Orbital Mixing Principles":  16,
+    "Molecular Orbital Theory and Delocalization":  17,
+    "Hydrogen Bonding":                             18,
+    "Back Bonding":                                 19,
+    "Bent's Rule":                                  20,
+    "Polarization Effects (Fajan's Rule + Polarizing Power)": 21,
+    "Solubility Product and Precipitation Logic":   22,
+    "Diagonal Relationship":                        23,
+    "Inert Pair Effect":                            24,
+    "Polymerization of Silicate Units":             25,
+    "Thermal Stability from Lattice Energy and Polarization": 26,
+    "Oxoacid Strength and Basicity from Structure": 27,
+    "Lanthanoid Contraction":                       28,
+    "Actinoid Contraction":                         29,
+    "4d and 5d Series Similarity Post-Lanthanoid Contraction": 30,
+    "Variable Oxidation State Stability in d-block": 31,
+    "Exchange Energy and Half-Filled Shell Stability": 32,
+    "Standard Electrode Potential Trends in d-block": 33,
+    "Magnetic Properties from Unpaired d-electrons": 34,
+    "Hard and Soft Acids and Bases (HSAB) Principle": 35,
+    "Electron-Deficient Bonding in Boranes":        36,
+    "VSEPR Application to Hypervalent Molecules":   37,
+    "Noble Gas Compound Stability":                 38,
+    "Redox Stability and Disproportionation Tendencies": 39,
+    "Spectrochemical Series":                       40,
+    "Crystal Field Splitting in Octahedral Field":  41,
+    "Crystal Field Splitting in Tetrahedral Field": 42,
+    "Crystal Field Stabilization Energy":           43,
+    "High-Spin vs Low-Spin Complexes":              44,
+    "Jahn-Teller Distortion":                       45,
+    "Ligand Field Theory":                          46,
+    "Color Origin in Coordination Compounds":       47,
+    "Chelate Effect":                               48,
+    "Stability Constants of Complexes":             49,
+    "Linkage Isomerism":                            50,
+    "Geometric Isomerism in Coordination Compounds": 51,
+    "Optical Isomerism in Coordination Compounds":  52,
+    "Ellingham Diagram and Thermodynamic Feasibility": 53,
+    "Electrochemical Reduction Principles in Metallurgy": 54,
+    "Coordination Number and Geometry Relationships": 55,
+    "Ligand Denticity and Polydentate Binding":     56,
+    # Handle both unicode and lossy-encoded variants of σ/π
+    "Metal-Ligand Bonding (σ and π interactions in complexes)": 57,
+    "Metal-Ligand Bonding (? and ? interactions in complexes)": 57,
 }
+
+
+def parse_a_vector(value) -> np.ndarray:
+    """Parse an a_vector from CSV (JSON string or list) into a numpy array of length N_DIMS."""
+    if isinstance(value, np.ndarray):
+        vec = value
+    elif isinstance(value, (list, tuple)):
+        vec = np.asarray(value, dtype=float)
+    else:
+        try:
+            parsed = json.loads(str(value))
+        except (ValueError, TypeError):
+            try:
+                import ast
+                parsed = ast.literal_eval(str(value))
+            except (ValueError, SyntaxError):
+                parsed = []
+        vec = np.asarray(parsed, dtype=float)
+    # Ensure exactly N_DIMS
+    vec = vec.reshape(-1)[:N_DIMS]
+    if len(vec) < N_DIMS:
+        vec = np.pad(vec, (0, N_DIMS - len(vec)))
+    return vec
+
+
+def calculate_dag_magnitude(residual: float, t: int, gamma_0: float = 0.35, beta: float = 1.0) -> float:
+    """Calculate decayed DAG evidence magnitude, vanishing as residual -> 0."""
+    gamma_t = gamma_0 / math.sqrt(1.0 + beta * t)
+    return min(gamma_t * abs(residual), 0.35)
 
 
 class CCMIRT:
@@ -111,9 +137,10 @@ class CCMIRT:
         self.weight_calibration_interval = max(1, int(weight_calibration_interval))
         self._prereq_attempt_log: list[dict] = []
         self._graph: nx.DiGraph = self._load_graph(concept_graph_path)
+        self._build_propagation_matrices()
 
     # ------------------------------------------------------------------
-    # Graph loading
+    # Graph loading & propagation matrix precomputation
     # ------------------------------------------------------------------
     def _load_graph(self, path: Optional[Path]) -> nx.DiGraph:
         p = path or (DATA_DIR / "concept_graph.csv")
@@ -121,9 +148,77 @@ class CCMIRT:
         if p.exists():
             df = pd.read_csv(p)
             for _, row in df.iterrows():
-                G.add_edge(row["source_concept"], row["target_concept"],
-                           weight=float(row["weight"]))
+                src = str(row["source_concept"]).strip()
+                tgt = str(row["target_concept"]).strip()
+                if src != "ROOT" and tgt != "ROOT":
+                    G.add_edge(src, tgt, weight=float(row.get("weight", 1.0)))
         return G
+
+    def _build_propagation_matrices(self,
+                                    gamma: float = 0.55,
+                                    alpha_up: float = 0.35,
+                                    alpha_down: float = 0.35) -> None:
+        """Precompute O(1) matrix propagation weights across the DAG."""
+        self._M_up = np.zeros((self.n_dims, self.n_dims), dtype=float)
+        self._M_down = np.zeros((self.n_dims, self.n_dims), dtype=float)
+
+        try:
+            path_lengths = dict(nx.all_pairs_shortest_path_length(self._graph))
+        except Exception:
+            path_lengths = {}
+
+        for source, targets in path_lengths.items():
+            if source not in CONCEPT_DIM_MAP:
+                continue
+            src_idx = CONCEPT_DIM_MAP[source]
+            for target, dist in targets.items():
+                if target not in CONCEPT_DIM_MAP or dist == 0:
+                    continue
+                tgt_idx = CONCEPT_DIM_MAP[target]
+                # source is prerequisite (parent), target is child
+                # If target is correct, propagate UP to prerequisite source:
+                self._M_up[src_idx, tgt_idx] = max(
+                    self._M_up[src_idx, tgt_idx],
+                    alpha_up * (gamma ** (dist - 1))
+                )
+                # If source is incorrect, propagate DOWN to child target:
+                self._M_down[tgt_idx, src_idx] = max(
+                    self._M_down[tgt_idx, src_idx],
+                    alpha_down * (gamma ** (dist - 1))
+                )
+
+    def propagate_dag_evidence(self,
+                               theta: np.ndarray,
+                               concept: str,
+                               correct: bool,
+                               residual: float,
+                               t: int = 0) -> np.ndarray:
+        """Propagate ability evidence through the prerequisite DAG.
+
+        - On correct: propagate positive evidence upward to all prerequisite ancestors.
+        - On incorrect: propagate negative evidence downward to all downstream descendants.
+        """
+        if concept not in CONCEPT_DIM_MAP:
+            return theta
+
+        c_idx = CONCEPT_DIM_MAP[concept]
+        th = theta.copy()
+        mag = calculate_dag_magnitude(residual, t)
+        if mag <= 1e-9:
+            return th
+
+        if correct:
+            weights = self._M_up[:, c_idx]
+            mask = weights > 0
+            # Pull prerequisites up towards mastery
+            th[mask] = np.maximum(th[mask], np.clip(th[mask] + weights[mask] * mag, -3.0, 3.0))
+        else:
+            weights = self._M_down[:, c_idx]
+            mask = weights > 0
+            # Pull descendants down towards weakness
+            th[mask] = np.minimum(th[mask], np.clip(th[mask] - weights[mask] * mag, -3.0, 3.0))
+
+        return np.clip(th, -3.0, 3.0)
 
     # ------------------------------------------------------------------
     # MIRT probability
@@ -175,36 +270,42 @@ class CCMIRT:
     def apply_soft_prereq_penalty(self,
                                   theta: np.ndarray,
                                   theta_by_concept: dict[str, float],
-                                  learning_rate: float = 0.05) -> np.ndarray:
-        """Take one gradient step on the prerequisite loss without clipping."""
+                                  learning_rate: float = 0.05,
+                                  t: int = 0) -> np.ndarray:
+        """Take one gradient step on the prerequisite loss with time-decayed learning rate."""
+        eta_prereq = learning_rate / (1.0 + 0.02 * t)
         gradients = self.prereq_penalty_gradients(theta_by_concept)
         for concept, gradient in gradients.items():
             if gradient == 0.0:
                 continue
             dim = CONCEPT_DIM_MAP.get(concept, 0)
-            theta[dim] -= learning_rate * gradient
-            theta_by_concept[concept] -= learning_rate * gradient
+            theta[dim] -= eta_prereq * gradient
+            theta_by_concept[concept] -= eta_prereq * gradient
         return np.clip(theta, -4.0, 4.0)
 
     def record_prereq_observation(self, concept: str, correct: bool) -> None:
         """Accumulate response evidence and periodically recalibrate edge weights."""
         self._prereq_attempt_log.append({"concept": concept, "correct": float(correct)})
+        if not hasattr(self, "_concept_correct_counts"):
+            self._concept_correct_counts = {}
+            self._concept_total_counts = {}
+        self._concept_correct_counts[concept] = self._concept_correct_counts.get(concept, 0) + int(correct)
+        self._concept_total_counts[concept] = self._concept_total_counts.get(concept, 0) + 1
         if len(self._prereq_attempt_log) % self.weight_calibration_interval == 0:
             self.calibrate_prereq_weights()
 
     def calibrate_prereq_weights(self, attempts: Optional[list[dict]] = None) -> None:
-        """Fit edge strengths from observed prerequisite/target performance.
-
-        An edge gains weight when target accuracy outpaces its prerequisite,
-        which is evidence that the graph penalty needs to pull the estimates
-        toward a more plausible ordering. A smoothed update prevents a small
-        response batch from dominating expert-initialized weights.
-        """
-        logs = attempts if attempts is not None else self._prereq_attempt_log
-        if not logs:
-            return
-        frame = pd.DataFrame(logs)
-        accuracy = frame.groupby("concept")["correct"].mean().to_dict()
+        """Fit edge strengths from observed prerequisite/target performance."""
+        if attempts is not None:
+            if not attempts:
+                return
+            frame = pd.DataFrame(attempts)
+            accuracy = frame.groupby("concept")["correct"].mean().to_dict()
+        else:
+            if not hasattr(self, "_concept_total_counts") or not self._concept_total_counts:
+                return
+            accuracy = {c: self._concept_correct_counts[c] / self._concept_total_counts[c]
+                        for c in self._concept_total_counts}
         for source, target, data in self._graph.edges(data=True):
             if source not in accuracy or target not in accuracy:
                 continue
@@ -243,7 +344,7 @@ class CCMIRT:
                     a_vec: np.ndarray,
                     d: float,
                     c_j: float = 0.25) -> np.ndarray:
-        """3×3 Fisher information matrix for one item (canonical 3PL MIRT formula).
+        """N_DIMS×N_DIMS Fisher information matrix for one item (canonical 3PL MIRT formula).
 
         For the 3PL model:  P = c + (1-c) * P*
         where P* = sigmoid(a·θ + d).

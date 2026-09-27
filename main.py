@@ -198,6 +198,8 @@ Examples:
     )
     parser.add_argument("--learners", type=int, default=200,
                         help="Number of synthetic learners per model run (default: 200)")
+    parser.add_argument("--max-questions", type=int, default=30,
+                        help="Maximum test questions per learner (default: 30)")
     parser.add_argument("--skip-data", action="store_true",
                         help="Skip raw data processing and reuse data/ artefacts")
     parser.add_argument("--suite", choices=SYSTEM_SUITES, default="final",
@@ -233,6 +235,7 @@ Examples:
 
     print(f"[Config] Random seed(s): {seeds_to_run} ({len(seeds_to_run)} run{'s' if len(seeds_to_run)>1 else ''})")
     print(f"[Config] Learners per run: {args.learners}")
+    print(f"[Config] Max questions per learner: {args.max_questions}")
 
     # ---- Step 1: Data processing ----
     if not args.skip_data:
@@ -251,7 +254,8 @@ Examples:
         if len(seeds_to_run) > 1:
             print(f"\n>>> Running Seed {seed_idx}/{len(seeds_to_run)} (seed={s}) <<<")
         bundles = run_all_stages(n_learners=args.learners, seed=s,
-                                 systems_to_run=systems_to_run)
+                                 systems_to_run=systems_to_run,
+                                 max_questions=args.max_questions)
         all_seed_bundles.append(bundles)
 
         for b in bundles:

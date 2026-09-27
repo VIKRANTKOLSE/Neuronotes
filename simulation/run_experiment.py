@@ -24,7 +24,7 @@ _CODES_DIR = Path(__file__).parent.parent
 if str(_CODES_DIR) not in sys.path:
     sys.path.insert(0, str(_CODES_DIR))
 
-from neuronotes.cc_mirt           import CCMIRT, CONCEPT_DIM_MAP
+from neuronotes.cc_mirt           import CCMIRT, CONCEPT_DIM_MAP, N_DIMS, parse_a_vector
 from neuronotes.c_matrix          import CMatrix
 from neuronotes.dynamic_c         import DynamicC
 from neuronotes.smd_vsnlms        import SMDVSNLMSUpdater, LearnerState
@@ -80,7 +80,8 @@ def run_one_learner(learner:     SyntheticLearner,
                     use_dynamic_c: bool = True,
                     use_smd:       bool = True,
                     use_router:    bool = True,
-                    use_prereq:    bool = True) -> dict:
+                    use_prereq:    bool = True,
+                    max_questions: int = MAX_QUESTIONS) -> dict:
     """Run one adaptive test session for a single learner.
 
     Returns a dict with per-learner results for metric computation.
@@ -93,6 +94,9 @@ def run_one_learner(learner:     SyntheticLearner,
         response_history=[],
     )
 
+    if updater is not None and hasattr(updater, "reset"):
+        updater.reset()
+
     theta_trajectory     = [state.theta.copy()]
     p_correct_log        = []
     correct_log          = []
@@ -100,7 +104,7 @@ def run_one_learner(learner:     SyntheticLearner,
     seen_items = set()
     active_misconception = None
 
-    for step in range(MAX_QUESTIONS):
+    for step in range(max_questions):
         # Select next item
         item_row = selector.select(
             theta=state.theta,
@@ -114,9 +118,7 @@ def run_one_learner(learner:     SyntheticLearner,
 
         item_id  = str(item_row["item_id"])
         concept  = str(item_row["concept"])
-        a_vec    = np.array([float(item_row["a1"]),
-                             float(item_row["a2"]),
-                             float(item_row["a3"])])
+        a_vec    = parse_a_vector(item_row["a_vector"])
         d_param  = float(item_row["d_param"])
         correct_option = int(item_row["correct_option"])
         seen_items.add(item_id)
@@ -138,6 +140,7 @@ def run_one_learner(learner:     SyntheticLearner,
         # Diagnose option
         if use_c_matrix:
             diag = c_mat.diagnose(item_id, selected_option)
+            z_mask = c_mat.item_distractor_mask(item_id, correct_option)
         else:
             diag = {
                 "error_class":       "correct" if correct else "conceptual_error",
@@ -149,6 +152,7 @@ def run_one_learner(learner:     SyntheticLearner,
                 "trap_weight":       0.0,
                 "rationale":         "",
             }
+            z_mask = np.zeros(15, dtype=float)
 
         error_class        = diag["error_class"]
         misconception_tag  = diag["misconception_tag"]
@@ -172,6 +176,9 @@ def run_one_learner(learner:     SyntheticLearner,
                 severity=severity,
                 z_vector=z_vector,
                 misconception_tags=misconception_tags,
+                z_mask=z_mask,
+                total_session_length=max_questions,
+                t=step,
             )
         else:
             # Fallback: simple gradient update (no semantic weighting)
@@ -184,7 +191,21 @@ def run_one_learner(learner:     SyntheticLearner,
 
         # Optimize the graph penalty after the evidence update.
         if use_prereq:
-            state.theta = mirt.apply_soft_prereq_penalty(state.theta, state.concept_theta)
+            residual_val = (1.0 if correct else 0.0) - p_resp
+            state.theta = mirt.propagate_dag_evidence(
+                theta=state.theta,
+                concept=concept,
+                correct=correct,
+                residual=residual_val,
+                t=step,
+            )
+            dim = CONCEPT_DIM_MAP.get(concept, 0)
+            state.concept_theta[concept] = float(state.theta[dim])
+            state.theta = mirt.apply_soft_prereq_penalty(
+                state.theta,
+                state.concept_theta,
+                t=step,
+            )
             mirt.record_prereq_observation(concept, correct)
 
         if use_dynamic_c:
@@ -339,7 +360,8 @@ def make_system(sys_name: str, items_path: Path, graph_path: Path) -> tuple:
 # ============================================================
 def run_all_stages(n_learners: int = N_LEARNERS,
                    seed: int = MASTER_SEED,
-                   systems_to_run: Optional[list[str]] = None) -> list[MetricBundle]:
+                   systems_to_run: Optional[list[str]] = None,
+                   max_questions: int = MAX_QUESTIONS) -> list[MetricBundle]:
     """Execute evaluation for all requested systems.
 
     Guarantees:
@@ -348,7 +370,7 @@ def run_all_stages(n_learners: int = N_LEARNERS,
     """
     print(f"\n{'='*60}")
     print(" Neuronotes Experiment Runner")
-    print(f" N_learners={n_learners}, seed={seed}, max_q={MAX_QUESTIONS}")
+    print(f" N_learners={n_learners}, seed={seed}, max_q={max_questions}")
     print(f"{'='*60}\n")
 
     items_path = DATA_DIR / "items_clean.csv"
@@ -392,13 +414,18 @@ def run_all_stages(n_learners: int = N_LEARNERS,
                 use_smd=use_smd,
                 use_router=use_rt,
                 use_prereq=use_pre,
+                max_questions=max_questions,
             )
             results.append(res)
 
-        # Thresholds selected on held-out validation partition (1/4 of pool)
-        validation_count   = max(1, len(results) // 4)
-        validation_results = results[:validation_count]
-        test_results       = results[validation_count:]
+        # Thresholds selected on held-out validation partition (1/4 of pool when >= 4)
+        if len(results) >= 4:
+            validation_count   = max(1, len(results) // 4)
+            validation_results = results[:validation_count]
+            test_results       = results[validation_count:]
+        else:
+            validation_results = results
+            test_results       = results
         thresholds = select_f1_thresholds(
             np.asarray([r["misc_y_true"] for r in validation_results]),
             np.asarray([r["misc_y_score"] for r in validation_results]),

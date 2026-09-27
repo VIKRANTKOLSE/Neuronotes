@@ -18,13 +18,13 @@ after a correct / incorrect response.
 Approximate posterior via a Gaussian update around current theta.
 """
 
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Optional
-from scipy.stats import multivariate_normal
 
-from .cc_mirt  import CCMIRT, CONCEPT_DIM_MAP
+from .cc_mirt  import CCMIRT, CONCEPT_DIM_MAP, N_DIMS, parse_a_vector
 from .c_matrix import CMatrix
 from .t_matrix import ColdStartRouter
 from .dynamic_c import DynamicC
@@ -84,9 +84,19 @@ class KLCAT:
         self.w_rep = w.get("rep",   W_REP)
 
         self._items: pd.DataFrame = pd.DataFrame()
+        self._A_cache: Optional[np.ndarray] = None  # pre-parsed (N, 58) matrix
         p = items_clean_path or (DATA_DIR / "items_clean.csv")
         if p.exists():
             self._items = pd.read_csv(p)
+            self._item_ids = self._items["item_id"].values.astype(str)
+            self._d_params = self._items["d_param"].values.astype(float)
+            self._c_params = self._items["c_j"].values.astype(float)
+            self._concept_dims = np.array([CONCEPT_DIM_MAP.get(c, 0) for c in self._items["concept"].values], dtype=int)
+            self._exposure_limits = self._items["item_exposure_limit"].values.astype(float)
+            # Pre-parse 58D a_vectors into numpy array cache
+            self._A_cache = np.stack(
+                self._items["a_vector"].apply(parse_a_vector).values
+            )  # (N, N_DIMS)
             # Pre-cache misconception diagnostic values (avoid recomputing per step)
             self._items = self._items.copy()
             self._items["_misc_diag"] = self._items.apply(
@@ -94,12 +104,22 @@ class KLCAT:
                     str(r["item_id"]), int(r["correct_option"])
                 ), axis=1
             )
+            self._misc_diag_cache = self._items["_misc_diag"].values.astype(float)
+            # Pre-compute mapping from misconception_tag -> set of item_ids for O(1) active misconception bonus
+            self._items_with_misc: dict[str, set[str]] = {}
+            for _, r in self._items.iterrows():
+                iid = str(r["item_id"])
+                opt = int(r["correct_option"])
+                for w in self.c_mat.all_wrong_options(iid, opt):
+                    tag = w.get("misconception_tag")
+                    if tag and tag not in {"none", "unknown_error"}:
+                        self._items_with_misc.setdefault(tag, set()).add(iid)
 
         # Exposure tracker: item_id -> count
         self._exposure: dict = {}
 
     # ------------------------------------------------------------------
-    # KL divergence between two 3D Gaussians (diagonal cov)
+    # KL divergence between two N_DIMS-D Gaussians (diagonal cov)
     # ------------------------------------------------------------------
     @staticmethod
     def _kl_diag_gaussian(mu1: np.ndarray, mu2: np.ndarray,
@@ -164,86 +184,82 @@ class KLCAT:
         if self._items.empty:
             return None
 
-        # Candidate pool: exclude seen items
-        candidates = self._items[~self._items["item_id"].isin(seen_items)]
-        if candidates.empty:
+        if not seen_items:
+            candidate_indices = np.arange(len(self._items))
+        else:
+            candidate_indices = np.flatnonzero(~np.isin(self._item_ids, list(seen_items)))
+
+        if len(candidate_indices) == 0:
             return None
 
         # ---- Vectorised KL gain ----
-        A = candidates[["a1", "a2", "a3"]].values          # (N, 3)
-        D = candidates["d_param"].values                    # (N,)
+        A = self._A_cache[candidate_indices]                 # (N, N_DIMS)
+        D = self._d_params[candidate_indices]                # (N,)
+        cand_ids = self._item_ids[candidate_indices]
         if self.dynamic_c is not None:
-            C = np.array([self.dynamic_c.get(str(iid)) for iid in candidates["item_id"].values], dtype=float)
+            C = np.array([self.dynamic_c.get(iid) for iid in cand_ids], dtype=float)
         else:
-            C = candidates["c_j"].values.astype(float)      # (N,)
+            C = self._c_params[candidate_indices]            # (N,)
 
-        logits  = A @ theta + D                             # (N,)
+        logits  = A @ theta + D                              # (N,)
         p_star  = 1.0 / (1.0 + np.exp(-logits))
-        P       = C + (1.0 - C) * p_star                   # (N,)
+        P       = C + (1.0 - C) * p_star                    # (N,)
         Q       = 1.0 - P
         lr      = 0.3
         sigma2  = THETA_SIGMA ** 2
 
         # post_1 = theta + lr*Q*a,  post_0 = theta - lr*P*a  (broadcast)
         # KL = ||delta||^2 / (2*sigma^2)
-        delta1  = lr * Q[:, None] * A                       # (N, 3)
+        delta1  = lr * Q[:, None] * A                        # (N, N_DIMS)
         delta0  = -lr * P[:, None] * A
         kl_1    = np.sum(delta1 ** 2, axis=1) / (2 * sigma2)
         kl_0    = np.sum(delta0 ** 2, axis=1) / (2 * sigma2)
-        kl_gain = P * kl_1 + Q * kl_0                      # (N,)
+        kl_gain = P * kl_1 + Q * kl_0                       # (N,)
 
-        # ---- Prereq bonus (vectorised via concept dim map) ----
+        # ---- Prereq bonus (vectorised via pre-cached concept dim map) ----
         if self.use_prereq:
-            dims    = candidates["concept"].map(
-                lambda c: CONCEPT_DIM_MAP.get(c, 0)
-            ).values                                        # (N,)
-            ability = theta[dims]                           # (N,)
+            dims    = self._concept_dims[candidate_indices]  # (N,)
+            ability = theta[dims]                            # (N,)
             pre     = np.clip(-ability, 0.0, 1.5)
         else:
-            pre = np.zeros(len(candidates))
+            pre = np.zeros(len(candidate_indices))
 
         # ---- Misconception diagnostic bonus (use pre-cached column) ----
-        if self.use_misc and "_misc_diag" in candidates.columns:
-            mis = candidates["_misc_diag"].values.astype(float)
-            if active_misconception:
-                # Only boost if we have an active target — skip expensive apply
-                boost = np.zeros(len(candidates))
-                for idx, (_, r) in enumerate(candidates.iterrows()):
-                    wrongs = self.c_mat.all_wrong_options(
-                        str(r["item_id"]), int(r["correct_option"])
-                    )
-                    if any(w["misconception_tag"] == active_misconception for w in wrongs):
-                        boost[idx] = 0.5
+        if self.use_misc:
+            mis = self._misc_diag_cache[candidate_indices].copy()
+            if active_misconception and hasattr(self, "_items_with_misc") and active_misconception in self._items_with_misc:
+                target_items = self._items_with_misc[active_misconception]
+                boost = np.isin(cand_ids, list(target_items)).astype(float) * 0.5
                 mis = mis + boost
         else:
-            mis = np.zeros(len(candidates))
+            mis = np.zeros(len(candidate_indices))
 
         # ---- Repetition penalty (vectorised) ----
         if self.use_rep_pen:
-            counts  = candidates["item_id"].map(
-                lambda iid: self._exposure.get(str(iid), 0)
-            ).values.astype(float)
-            limits  = candidates["item_exposure_limit"].values.astype(float)
+            counts  = np.array([self._exposure.get(iid, 0) for iid in cand_ids], dtype=float)
+            limits  = self._exposure_limits[candidate_indices]
             ratio   = counts / np.maximum(limits, 1)
             rep     = ratio ** 2
             # Hard-exclude over-exposed (set score to -inf)
             over    = counts >= limits
             rep[over] = 1e6
         else:
-            rep = np.zeros(len(candidates))
+            rep = np.zeros(len(candidate_indices))
 
         # ---- Cold-start routing (only before any response evidence) ----
-        cold = np.zeros(len(candidates))
+        cold = np.zeros(len(candidate_indices))
         if self.use_cold_start and not seen_items:
             target_concept = self.cold_start.recommend_concept(set())
             if target_concept:
-                cold = (candidates["concept"].values == target_concept).astype(float)
+                cand_concepts = self._items["concept"].values[candidate_indices]
+                cold = (cand_concepts == target_concept).astype(float)
 
         # ---- Combined utility ----
         scores   = (self.w_kl * kl_gain + self.w_pre * pre
                     + self.w_mis * mis - self.w_rep * rep + 0.5 * cold)
-        best_idx = int(np.argmax(scores))
-        best_row = candidates.iloc[best_idx]
+        best_pos = int(np.argmax(scores))
+        best_idx = candidate_indices[best_pos]
+        best_row = self._items.iloc[best_idx]
 
         # Increment exposure
         bid = str(best_row["item_id"])

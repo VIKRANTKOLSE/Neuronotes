@@ -1,7 +1,7 @@
 """
 data_processing.py
 ==================
-Step 1: Process neuronotes_final_master_READY.csv into three clean artefacts:
+Step 1: Process questions_final_qmatrix.csv into three clean artefacts:
   - data/items_clean.csv        — parsed item bank for psychometric modelling
   - data/item_options.csv       — one row per answer option with misconception tags
   - data/concept_graph.csv      — directed prerequisite graph edges
@@ -18,9 +18,16 @@ import pandas as pd
 import networkx as nx
 from pathlib import Path
 
-RAW_CSV   = Path(__file__).parent.parent / "neuronotes_final_master_READY.csv"
+# ---------------------------------------------------------------------------
+# Source data — use the calibrated Q-matrix CSV (post-rectification pipeline).
+# Original: questions_final_qmatrix.csv → rectified by rectify_qmatrix.py
+# ---------------------------------------------------------------------------
+RAW_CSV   = Path(__file__).parent / "data" / "questions_calibrated_qmatrix.csv"
 DATA_DIR  = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
+
+# Number of MIRT ability dimensions (one per Q-matrix node / concept)
+N_DIMS = 58
 
 # ---------------------------------------------------------------------------
 # Error class heuristics from reason text
@@ -61,18 +68,28 @@ def infer_misconception_tag(z_vec: list[int]) -> str:
     active = [i for i, value in enumerate(z_vec) if int(value) == 1]
     return f"z_{active[0]:02d}" if active else "unknown_error"
 
-def infer_semantic_dimension(skill_vector: list[int]) -> str:
-    """Map the first active dimension of the item's skill vector to a label."""
-    dim_labels = [
-        "recall", "application", "analysis", "synthesis",
-        "evaluation", "calculation", "comparison", "classification",
-        "inference", "explanation", "prediction", "generalisation",
-        "transfer", "critique", "design"
-    ]
-    for i, v in enumerate(skill_vector):
-        if v == 1:
-            return dim_labels[i]
-    return "recall"
+def infer_semantic_dimension(a_vector: list[float]) -> str:
+    """Map the primary active dimension of the 58-dim a_vector to a label.
+
+    Uses a coarse grouping of the 58 Q-matrix dimensions into cognitive
+    categories based on the tier structure of the concept DAG.
+    """
+    # Find primary active dimension
+    if not a_vector:
+        return "recall"
+    primary_dim = max(range(len(a_vector)), key=lambda i: abs(a_vector[i]))
+
+    # Coarse cognitive category mapping based on tier groupings
+    if primary_dim <= 9:
+        return "recall"           # foundational / Tier 0-2
+    elif primary_dim <= 22:
+        return "application"      # periodic trends / Tier 3-4
+    elif primary_dim <= 39:
+        return "analysis"         # bonding, d-block / Tier 5-6
+    elif primary_dim <= 49:
+        return "synthesis"        # coordination chemistry / Tier 7-8
+    else:
+        return "evaluation"       # isomerism, metallurgy / Tier 9-10
 
 
 def initial_dynamic_c(semantic_entrapment: float) -> float:
@@ -102,48 +119,54 @@ def build_items_clean(df: pd.DataFrame) -> pd.DataFrame:
     records = []
     for _, row in df.iterrows():
         a_vec  = parse_vec(row["a_vector"])
-        sv     = parse_vec(row["skill_vector"])
         z1     = parse_vec(row["z1"])
         z2     = parse_vec(row["z2"])
         z3     = parse_vec(row["z3"])
         z4     = parse_vec(row["z4"])
 
+        # Pad / truncate a_vector to exactly N_DIMS
+        if len(a_vec) < N_DIMS:
+            a_vec = a_vec + [0.0] * (N_DIMS - len(a_vec))
+        a_vec = a_vec[:N_DIMS]
+
+        correct_opt = int(row["correct_option"])
+
         # Entrapment index: average trap weight of wrong options
         wrong_zs   = [z for i, z in enumerate([z1, z2, z3, z4])
-                      if (i + 1) != int(row["correct_option"])]
+                      if (i + 1) != correct_opt]
         trap_weights = [infer_trap_weight(z) for z in wrong_zs]
         entrapment_index = round(sum(trap_weights) / len(trap_weights), 4) if trap_weights else 0.0
 
         # Empirical and ambiguity terms are filled by DynamicC after attempts.
         c_j = initial_dynamic_c(entrapment_index)
 
+        # Concept name — normalise unicode variants
+        concept = str(row["concept"]).strip()
+
+        # Use source_id as item_id (qmatrix uses 'source_id' not 'id')
+        item_id = str(row.get("source_id", row.get("id", f"item_{_}")))
+
         records.append({
-            "item_id":            row["id"],
-            "concept":            row["concept"],
-            "concept_id":         row["concept_id"],
-            "prereqs":            row["prereqs"],
-            "prereq_ids":         row["prereq_ids"],
-            "question_type":      row["question_type"],
-            "difficulty_tier":    row["difficulty_tier"],
-            "correct_option":     int(row["correct_option"]),
-            "a1":                 a_vec[0] if len(a_vec) > 0 else 1.0,
-            "a2":                 a_vec[1] if len(a_vec) > 1 else 0.5,
-            "a3":                 a_vec[2] if len(a_vec) > 2 else 0.5,
+            "item_id":            item_id,
+            "concept":            concept,
+            "prereqs":            str(row.get("prereqs", "")),
+            "correct_option":     correct_opt,
+            "a_vector":           json.dumps(a_vec),
             "d_param":            float(row["d_param"]),
-            "skill_dim1":         sv[0] if len(sv) > 0 else 0,
-            "skill_dim2":         sv[1] if len(sv) > 1 else 0,
-            "skill_dim3":         sv[2] if len(sv) > 2 else 0,
             "entrapment_index":   entrapment_index,
             "semantic_entrapment": entrapment_index,
             "empirical_entrapment": 0.0,
             "ambiguity_index":    0.0,
             "c_j":                c_j,
-            "estimated_time_sec": int(row["estimated_time_sec"]),
-            "item_exposure_limit":int(row["item_exposure_limit"]),
-            "status":             row["status"],
-            "content_validated":  row["content_validated"],
-            "misconception_validated": row["misconception_validated"],
-            "version":            row["version"],
+            # Provide sensible defaults for metadata absent from qmatrix
+            "estimated_time_sec": int(row.get("estimated_time_sec", 90)),
+            "item_exposure_limit":int(row.get("item_exposure_limit", 60)),
+            "question_type":      str(row.get("question_type", "MCQ")),
+            "difficulty_tier":    str(row.get("difficulty_tier", "medium")),
+            "status":             str(row.get("status", "active")),
+            "content_validated":  bool(row.get("content_validated", True)),
+            "misconception_validated": bool(row.get("misconception_validated", True)),
+            "version":            str(row.get("version", "1.0")),
         })
 
     return pd.DataFrame(records)
@@ -154,10 +177,10 @@ def build_items_clean(df: pd.DataFrame) -> pd.DataFrame:
 def build_item_options(df: pd.DataFrame) -> pd.DataFrame:
     records = []
     for _, row in df.iterrows():
-        item_id     = row["id"]
-        concept     = row["concept"]
+        item_id     = str(row.get("source_id", row.get("id", "")))
+        concept     = str(row["concept"]).strip()
         correct_opt = int(row["correct_option"])
-        sv          = parse_vec(row["skill_vector"])
+        a_vec       = parse_vec(row["a_vector"])
 
         for opt_no in range(1, 5):
             opt_text = str(row[f"opt{opt_no}"])
@@ -186,9 +209,9 @@ def build_item_options(df: pd.DataFrame) -> pd.DataFrame:
                 "error_class":       error_class,
                 "severity":          severity,
                 "trap_weight":       trap_weight,
-                "semantic_dimension": infer_semantic_dimension(sv),
+                "semantic_dimension": infer_semantic_dimension(a_vec),
                 "expert_confidence": "high",
-                "review_status":     row["status"],
+                "review_status":     str(row.get("status", "active")),
                 "z_vector":          str(z_vec),
             })
 
@@ -208,7 +231,6 @@ CONCEPT_PREREQ_MAP = {
     # Periodic Trends chain
     "Atomic Radius Trend":            ["Effective Nuclear Charge", "Shielding Effect"],
     "Ionization Enthalpy Trend":      ["Atomic Radius Trend", "Effective Nuclear Charge"],
-    "Third Ionization Enthalpy Anomalies": ["Ionization Enthalpy Trend"],
     "Electron Gain Enthalpy Trend":   ["Atomic Radius Trend", "Electron-Electron Repulsion"],
     "Electronegativity Trend":        ["Ionization Enthalpy Trend", "Atomic Radius Trend"],
     "Charge Density (Z/r) and Ionic Potential": ["Atomic Radius Trend"],
@@ -224,7 +246,6 @@ CONCEPT_PREREQ_MAP = {
     "Hybridization and Orbital Mixing Principles": ["Sigma and Pi Bonding in Molecular Orbitals"],
     "Valence Shell Electron Pair Repulsion Theory": ["Hybridization and Orbital Mixing Principles"],
     "VSEPR Application to Hypervalent Molecules": ["Valence Shell Electron Pair Repulsion Theory"],
-    "VSEPR Hypervalent Geometry":     ["VSEPR Application to Hypervalent Molecules"],
     "Bent's Rule":                    ["Hybridization and Orbital Mixing Principles"],
     "Dipole Moment and Molecular Polarity": ["Valence Shell Electron Pair Repulsion Theory", "Electronegativity Trend"],
     "Hydrogen Bonding":               ["Electronegativity Trend", "Dipole Moment and Molecular Polarity"],
@@ -232,7 +253,7 @@ CONCEPT_PREREQ_MAP = {
     "Back Bonding":                   ["Sigma and Pi Bonding in Molecular Orbitals", "Orbital Penetration"],
     "Electron-Deficient Bonding in Boranes": ["Sigma and Pi Bonding in Molecular Orbitals"],
     "Oxoacid Strength and Basicity from Structure": ["Electronegativity Trend", "Polarization Effects (Fajan's Rule + Polarizing Power)"],
-    "Noble Gas Compound Stability":   ["Hybridization and Orbital Mixing Principles", "VSEPR Hypervalent Geometry"],
+    "Noble Gas Compound Stability":   ["Hybridization and Orbital Mixing Principles", "VSEPR Application to Hypervalent Molecules"],
     "Polymerization of Silicate Units": ["Sigma and Pi Bonding in Molecular Orbitals"],
 
     # Coordination Chemistry chain
@@ -247,15 +268,13 @@ CONCEPT_PREREQ_MAP = {
     "Spectrochemical Series":         ["Metal-Ligand Bonding (σ and π interactions in complexes)"],
     "Jahn-Teller Distortion":         ["Crystal Field Splitting in Octahedral Field"],
     "Ligand Field Theory":            ["Crystal Field Splitting in Octahedral Field", "Molecular Orbital Theory and Delocalization"],
-    "t2g Orbital Pi Bonding":         ["Metal-Ligand Bonding (σ and π interactions in complexes)", "Crystal Field Splitting in Octahedral Field"],
     "Magnetic Properties from Unpaired d-electrons": ["Crystal Field Stabilization Energy", "High-Spin vs Low-Spin Complexes"],
     "Color Origin in Coordination Compounds": ["Crystal Field Splitting in Octahedral Field", "Spectrochemical Series"],
     "Stability Constants of Complexes": ["Metal-Ligand Bonding (σ and π interactions in complexes)", "Chelate Effect"],
     "Geometric Isomerism in Coordination Compounds": ["Coordination Number and Geometry Relationships"],
     "Optical Isomerism in Coordination Compounds": ["Geometric Isomerism in Coordination Compounds"],
     "Linkage Isomerism":              ["Coordination Number and Geometry Relationships"],
-    "HSAB Principle":                 ["Electronegativity Trend", "Polarization Effects (Fajan's Rule + Polarizing Power)"],
-    "Hard and Soft Acids and Bases (HSAB) Principle": ["HSAB Principle"],
+    "Hard and Soft Acids and Bases (HSAB) Principle": ["Electronegativity Trend", "Polarization Effects (Fajan's Rule + Polarizing Power)"],
 
     # d-block / f-block
     "Variable Oxidation State Stability in d-block": ["Ionization Enthalpy Trend", "Crystal Field Stabilization Energy"],

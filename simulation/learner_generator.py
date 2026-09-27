@@ -2,7 +2,7 @@
 learner_generator.py — Synthetic Learner Population Generator
 ==============================================================
 Generates N simulated learners with:
-  - Known 3D ability vectors (θ_true)
+  - Known 58D ability vectors (θ_true)
   - Prerequisite-linked mastery patterns
   - Known misconception states per concept
   - Distractor-selection probabilities matching their misconceptions
@@ -14,20 +14,43 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 
+from neuronotes.cc_mirt import N_DIMS, CONCEPT_DIM_MAP, parse_a_vector
 from neuronotes.c_matrix import CMatrix
 
 # Reproducible seeds
 DEFAULT_SEED = 42
 N_SEMANTIC_DIMS = 15
 
-# Profile archetypes
+# Profile archetypes across 4 concept tiers:
+#   Tier 1: 10 concepts (indices 0–9)
+#   Tier 2: 13 concepts (indices 10–22)
+#   Tier 3: 17 concepts (indices 23–39)
+#   Tier 4: 18 concepts (indices 40–57)
+# Total: 58 dimensions
+def _make_profile_vectors(tier_means: tuple[float, float, float, float],
+                          tier_stds: tuple[float, float, float, float] = (0.3, 0.3, 0.3, 0.3)) -> dict:
+    m = np.concatenate([
+        np.full(10, tier_means[0]),
+        np.full(13, tier_means[1]),
+        np.full(17, tier_means[2]),
+        np.full(18, tier_means[3]),
+    ])
+    s = np.concatenate([
+        np.full(10, tier_stds[0]),
+        np.full(13, tier_stds[1]),
+        np.full(17, tier_stds[2]),
+        np.full(18, tier_stds[3]),
+    ])
+    return {"theta_mean": m, "theta_std": s}
+
+
 PROFILES = {
-    "strong_all":     {"theta_mean": [1.5,  1.5,  1.5],  "theta_std": [0.3, 0.3, 0.3]},
-    "weak_all":       {"theta_mean": [-1.5, -1.5, -1.5], "theta_std": [0.3, 0.3, 0.3]},
-    "strong_found":   {"theta_mean": [1.2,  0.0, -0.5],  "theta_std": [0.2, 0.4, 0.4]},
-    "strong_bonding": {"theta_mean": [0.5,  1.2,  0.0],  "theta_std": [0.4, 0.2, 0.4]},
-    "strong_coord":   {"theta_mean": [-0.2, 0.5,  1.5],  "theta_std": [0.4, 0.4, 0.2]},
-    "mixed":          {"theta_mean": [0.0,  0.0,  0.0],  "theta_std": [0.8, 0.8, 0.8]},
+    "strong_all":     _make_profile_vectors((1.5, 1.5, 1.5, 1.5), (0.3, 0.3, 0.3, 0.3)),
+    "weak_all":       _make_profile_vectors((-1.5, -1.5, -1.5, -1.5), (0.3, 0.3, 0.3, 0.3)),
+    "strong_found":   _make_profile_vectors((1.2, 0.5, 0.0, -0.5), (0.2, 0.3, 0.4, 0.4)),
+    "strong_bonding": _make_profile_vectors((0.5, 1.2, 1.0, 0.0), (0.4, 0.2, 0.3, 0.4)),
+    "strong_coord":   _make_profile_vectors((0.0, 0.3, 0.8, 1.5), (0.4, 0.4, 0.3, 0.2)),
+    "mixed":          _make_profile_vectors((0.0, 0.0, 0.0, 0.0), (0.8, 0.8, 0.8, 0.8)),
 }
 
 
@@ -36,8 +59,8 @@ class SyntheticLearner:
     """One simulated learner with ground-truth state."""
     learner_id:                 str
     profile:                    str
-    theta_true:                 np.ndarray          # ground-truth 3D ability
-    theta_init:                 np.ndarray          # starting estimate (θ₀ = [0,0,0])
+    theta_true:                 np.ndarray          # ground-truth 58D ability
+    theta_init:                 np.ndarray          # starting estimate (θ₀ = zeros(58))
     misconception_true:         dict                # tag → true strength [0,1]
     concept_mastery:            dict                # concept → True/False (prerequisite-aware)
     misconception_true_vector:  np.ndarray          # binary shared-ontology ground truth
@@ -75,41 +98,37 @@ class LearnerGenerator:
             profile = self.rng.choice(profile_names, p=profile_probs)
             spec    = PROFILES[profile]
 
-            # Sample true ability
+            # Sample true ability (58 dimensions)
             theta_true = np.clip(
                 self.rng.normal(spec["theta_mean"], spec["theta_std"]),
                 -3.0, 3.0
             )
 
-            # Sample misconceptions: learners with low foundational ability
+            # Sample misconceptions: learners with low foundational ability (Tier 1)
             # are more likely to have strong misconceptions
             misc_state = {}
             misc_vector = np.zeros(N_SEMANTIC_DIMS, dtype=int)
-            weakness = max(0.0, -float(np.mean(theta_true[:2]))) / 3.0
+            weakness = max(0.0, -float(np.mean(theta_true[:10]))) / 3.0
+
             # Each ontology dimension receives independent ground truth so
             # AUROC can be evaluated as a real multilabel ranking problem.
-            # A single loop covers all 15 dims — the old MISCONCEPTION_ARCHETYPES
-            # loop was removed because it overwrote z_00–z_04 with a separate
-            # RNG draw, creating an inconsistency between misc_state and
-            # misc_vector that corrupted AUROC computation.
             for dim in range(N_SEMANTIC_DIMS):
                 prevalence = min(0.08 + 0.52 * weakness + 0.02 * (dim % 3), 0.80)
                 if self.rng.random() < prevalence:
                     misc_vector[dim] = 1
                     misc_state[f"z_{dim:02d}"] = float(self.rng.uniform(0.3, 0.9))
 
-            # Concept mastery: a concept is "mastered" if its dimension ability > 0
+            # Concept mastery: a concept is "mastered" if its primary dimension ability > 0
             concept_mastery = {
-                "foundational": bool(theta_true[0] > 0),
-                "periodic_bonding": bool(theta_true[1] > 0),
-                "coordination_advanced": bool(theta_true[2] > 0),
+                concept_name: bool(theta_true[dim] > 0)
+                for concept_name, dim in CONCEPT_DIM_MAP.items()
             }
 
             learners.append(SyntheticLearner(
                 learner_id=f"L{i:04d}",
                 profile=profile,
                 theta_true=theta_true,
-                theta_init=np.zeros(3),
+                theta_init=np.zeros(N_DIMS),
                 misconception_true=misc_state,
                 misconception_true_vector=misc_vector,
                 concept_mastery=concept_mastery,
@@ -127,10 +146,17 @@ class LearnerGenerator:
 
         Returns (correct: bool, selected_option: int 1-indexed).
         """
-        a_vec = np.array([float(item_row["a1"]),
-                          float(item_row["a2"]),
-                          float(item_row["a3"])])
-        d     = float(item_row["d_param"])
+        if "a_vector" in item_row:
+            a_vec = parse_a_vector(item_row["a_vector"])
+        elif all(f"a{k}" in item_row for k in range(1, 4)):
+            a_vec = np.zeros(N_DIMS)
+            a_vec[0] = float(item_row["a1"])
+            a_vec[1] = float(item_row["a2"])
+            a_vec[2] = float(item_row["a3"])
+        else:
+            a_vec = np.zeros(N_DIMS)
+
+        d = float(item_row["d_param"])
 
         logit     = float(np.dot(a_vec, learner.theta_true)) + d
         p_star    = 1.0 / (1.0 + np.exp(-logit))

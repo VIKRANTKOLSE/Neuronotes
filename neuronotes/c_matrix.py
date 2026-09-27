@@ -157,3 +157,20 @@ class CMatrix:
         if not distractors:
             return 0.0
         return sum(d["trap_weight"] for d in distractors) / len(distractors)
+
+    def item_distractor_mask(self, item_id: str, correct_option: Optional[int] = None) -> np.ndarray:
+        """Return a binary 15D mask indicating which misconceptions are present in the item's distractors."""
+        mask = np.zeros(15, dtype=float)
+        for opt in range(1, 5):
+            rec = self._matrix.get((str(item_id), opt))
+            if rec is not None:
+                if correct_option is not None:
+                    if opt == int(correct_option) or rec.get("is_correct", False):
+                        continue
+                elif rec.get("is_correct", False):
+                    continue
+                z = rec.get("z_vector")
+                if z is not None and len(z) > 0:
+                    vec = np.asarray(z, dtype=float)[:15]
+                    mask = np.maximum(mask, (vec > 0).astype(float))
+        return mask
