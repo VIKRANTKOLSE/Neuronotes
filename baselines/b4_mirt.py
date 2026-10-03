@@ -41,17 +41,15 @@ class MIRTSelector:
         if pool.empty:
             return None
         candidate_indices = np.flatnonzero(mask.values)
-        A      = self._A[candidate_indices]                # (N, N_DIMS)
-        D      = pool["d_param"].values.astype(float)      # (N,)
+        A      = self._A[candidate_indices]
+        D      = pool["d_param"].values.astype(float)
         logits = A @ theta + D
         p_star = 1.0 / (1.0 + np.exp(-logits))
         P      = FIXED_C + (1.0 - FIXED_C) * p_star
         Q      = 1.0 - P
         PQ     = np.maximum(P * Q, 1e-9)
-        dP     = (P - FIXED_C) * PQ / max((1.0 - FIXED_C) ** 2, 1e-9)
-        scale  = (dP ** 2) / PQ
-        # trace(I) = scale * ||a||^2
-        info   = scale * np.sum(A ** 2, axis=1)
+        dP_dtheta = (1.0 - FIXED_C) * p_star * (1.0 - p_star)
+        info   = (dP_dtheta ** 2) / PQ * np.sum(A ** 2, axis=1)
         return pool.iloc[int(np.argmax(info))]
 
     def reset_exposure(self): pass

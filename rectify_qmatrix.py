@@ -30,7 +30,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='repla
 # -- Configuration ---------------------------------------------------------
 SEED = 42
 SLIP_INJECTION_RATE = 0.15   # 15% of wrong options get their z-vector zeroed
-INPUT_CSV  = Path("data/questions_final_qmatrix.csv")
+INPUT_CSV  = Path("data/questions_final_with_E.csv")
 OUTPUT_CSV = Path("data/questions_calibrated_qmatrix.csv")
 
 random.seed(SEED)

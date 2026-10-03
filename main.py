@@ -42,6 +42,7 @@ if str(_CODES_DIR) not in sys.path:
 import data_processing
 from simulation.run_experiment import run_all_stages, save_results, RESULTS_DIR, DATA_DIR
 from simulation.metrics import MetricBundle, cohens_d
+from neuronotes.offline_calibrator import OfflineCalibrator
 
 SYSTEM_SUITES = {
     # Default: the deployable model only, for quick iteration.
@@ -214,6 +215,9 @@ Examples:
                         help="List of random seeds to evaluate for multi-seed aggregation")
     parser.add_argument("--n-seeds", type=int, default=None,
                         help="Run N consecutive seeds starting from --seed (e.g. --n-seeds 5)")
+    parser.add_argument("--calibrate-threshold", type=int, default=0, metavar="N",
+                        help="Enable offline E recalibration after every N learners (e.g. 1000). "
+                             "0 = disabled (default).")
     args = parser.parse_args()
 
     # Determine seed list
@@ -247,6 +251,15 @@ Examples:
     # ---- Step 2 & 3: Simulation across seeds ----
     print("\n[Step 2] Running Experiments")
 
+    # Set up offline calibrator if requested
+    calibrator = None
+    if args.calibrate_threshold > 0:
+        calibrator = OfflineCalibrator(
+            items_clean_path=DATA_DIR / "items_clean.csv",
+            threshold=args.calibrate_threshold,
+        )
+        print(f"[Config] Offline E recalibration enabled (threshold={args.calibrate_threshold} learners)")
+
     all_seed_bundles = []
     seed_records = []
 
@@ -257,6 +270,20 @@ Examples:
                                  systems_to_run=systems_to_run,
                                  max_questions=args.max_questions)
         all_seed_bundles.append(bundles)
+
+        # Check if offline recalibration should fire
+        if calibrator is not None and calibrator.should_recalibrate():
+            report = calibrator.recalibrate()
+            print(f"\n  [OFFLINE RECALIBRATION] Round {report.calibration_round}")
+            print(f"    Responses processed: {report.total_responses}")
+            print(f"    Items updated: {report.items_updated}")
+            print(f"    Items flagged (E mismatch): {report.items_flagged}")
+            print(f"    Shrinkage α: {report.alpha_used}")
+            print(f"    Mean |ΔE_sem|: {report.mean_abs_delta_e_sem:.4f}")
+            print(f"    New coefficients: {report.coefficient_update}")
+            if report.flagged_items:
+                print(f"    Flagged items: {', '.join(report.flagged_items[:10])}")
+            print(f"    z-dim trap rates: {report.z_dim_trap_rates}")
 
         for b in bundles:
             seed_records.append({

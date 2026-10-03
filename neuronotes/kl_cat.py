@@ -139,9 +139,14 @@ class KLCAT:
         q  = 1.0 - p
         lr = 0.3  # proxy update step (mirrors SMD-VSNLMS base_lr)
 
+        if hasattr(self.mirt, "diffusion_matrix"):
+            effective_a = self.mirt.diffusion_matrix @ a_vec
+        else:
+            effective_a = a_vec
+
         # Approximate posterior means after correct / incorrect
-        post_1 = np.clip(theta + lr * q * a_vec, -4, 4)
-        post_0 = np.clip(theta - lr * p * a_vec, -4, 4)
+        post_1 = np.clip(theta + lr * q * effective_a, -4, 4)
+        post_0 = np.clip(theta - lr * p * effective_a, -4, 4)
 
         kl_1   = self._kl_diag_gaussian(post_1, theta)
         kl_0   = self._kl_diag_gaussian(post_0, theta)
@@ -229,7 +234,7 @@ class KLCAT:
             mis = self._misc_diag_cache[candidate_indices].copy()
             if active_misconception and hasattr(self, "_items_with_misc") and active_misconception in self._items_with_misc:
                 target_items = self._items_with_misc[active_misconception]
-                boost = np.isin(cand_ids, list(target_items)).astype(float) * 0.5
+                boost = np.isin(cand_ids, list(target_items)).astype(float) * 0.6
                 mis = mis + boost
         else:
             mis = np.zeros(len(candidate_indices))

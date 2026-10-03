@@ -167,6 +167,26 @@ class CCMIRT:
         except Exception:
             path_lengths = {}
 
+        import scipy.linalg
+        
+        # Build diffusion matrix
+        adjacency = np.zeros((self.n_dims, self.n_dims), dtype=float)
+        for u, v in self._graph.edges():
+            if u in CONCEPT_DIM_MAP and v in CONCEPT_DIM_MAP:
+                idx_u = CONCEPT_DIM_MAP[u]
+                idx_v = CONCEPT_DIM_MAP[v]
+                adjacency[idx_u, idx_v] = 1.0
+                adjacency[idx_v, idx_u] = 1.0
+        
+        degrees = np.sum(adjacency, axis=1)
+        L = np.diag(degrees) - adjacency
+        self.L = L
+        
+        # Heat kernel diffusion: expm(-t * L)
+        # t controls how far information diffuses. 
+        # t=0.8 -> moderate local diffusion, avoids spreading noise globally
+        self.diffusion_matrix = scipy.linalg.expm(-0.8 * L)
+
         for source, targets in path_lengths.items():
             if source not in CONCEPT_DIM_MAP:
                 continue
@@ -208,15 +228,15 @@ class CCMIRT:
             return th
 
         if correct:
-            weights = self._M_up[:, c_idx]
+            weights = np.maximum(self._M_up[:, c_idx], self._M_down[:, c_idx])
             mask = weights > 0
-            # Pull prerequisites up towards mastery
-            th[mask] = np.maximum(th[mask], np.clip(th[mask] + weights[mask] * mag, -3.0, 3.0))
+            # Pull connected concepts up
+            th[mask] = np.clip(th[mask] + weights[mask] * mag, -3.0, 3.0)
         else:
-            weights = self._M_down[:, c_idx]
+            weights = np.maximum(self._M_down[:, c_idx], self._M_up[:, c_idx])
             mask = weights > 0
-            # Pull descendants down towards weakness
-            th[mask] = np.minimum(th[mask], np.clip(th[mask] - weights[mask] * mag, -3.0, 3.0))
+            # Pull connected concepts down
+            th[mask] = np.clip(th[mask] - weights[mask] * mag, -3.0, 3.0)
 
         return np.clip(th, -3.0, 3.0)
 

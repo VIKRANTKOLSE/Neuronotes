@@ -51,8 +51,8 @@ class IRT3PLSelector:
         P = FIXED_C + (1.0 - FIXED_C) * p_star
         Q = 1.0 - P
         PQ = np.maximum(P * Q, 1e-9)
-        dP = (P - FIXED_C) * PQ / max((1.0 - FIXED_C) ** 2, 1e-9)
-        info = (dP ** 2) / PQ
+        dP_dtheta = (1.0 - FIXED_C) * p_star * (1.0 - p_star)
+        info = (dP_dtheta ** 2) / PQ
         return pool.iloc[int(np.argmax(info))]
 
     def reset_exposure(self): pass

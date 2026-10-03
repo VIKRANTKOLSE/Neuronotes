@@ -19,7 +19,10 @@ from neuronotes.c_matrix import CMatrix
 
 # Reproducible seeds
 DEFAULT_SEED = 42
-N_SEMANTIC_DIMS = 15
+# The populated chemistry ontology currently defines four semantic families.
+# Vectors are padded to the C-matrix's 15-slot schema below so inactive slots
+# are excluded rather than treated as unobservable positive labels.
+N_SEMANTIC_DIMS = 4
 
 # Profile archetypes across 4 concept tiers:
 #   Tier 1: 10 concepts (indices 0–9)
@@ -130,7 +133,7 @@ class LearnerGenerator:
                 theta_true=theta_true,
                 theta_init=np.zeros(N_DIMS),
                 misconception_true=misc_state,
-                misconception_true_vector=misc_vector,
+                misconception_true_vector=np.pad(misc_vector, (0, 15 - N_SEMANTIC_DIMS)),
                 concept_mastery=concept_mastery,
                 rng=np.random.default_rng(int(self.rng.integers(0, 2**31))),
             ))

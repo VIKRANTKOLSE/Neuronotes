@@ -24,28 +24,17 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 
 # Domain-specific Chemistry Misconception Ontology Mapping (z_00 to z_14)
 MISCONCEPTION_ONTOLOGY = {
-    "z_00": "Shielding_vs_Nuclear_Charge_Confusion",
-    "z_01": "Penetration_Distance_Quantum_Inversion",
-    "z_02": "Electron_Repulsion_Pairing_Energy_Omission",
-    "z_03": "Orbital_Energy_Level_Splitting_Reversal",
-    "z_04": "Exchange_Energy_Subshell_Stability_Neglect",
-    "z_05": "Periodic_Radius_Lattice_Trend_Inversion",
-    "z_06": "Ionization_Gain_Enthalpy_Anomaly_Confusion",
-    "z_07": "Electronegativity_Polarization_Fajan_Confusion",
-    "z_08": "Hybridization_VSEPR_Geometry_Mismatch",
-    "z_09": "Bent_Rule_Hypervalent_Bonding_Misconception",
-    "z_10": "Pi_Back_Bonding_Electron_Density_Reversal",
-    "z_11": "Crystal_Field_Splitting_Oct_Tet_Confusion",
-    "z_12": "High_Low_Spin_Pairing_Condition_Inversion",
-    "z_13": "Spectrochemical_Series_Ligand_Strength_Error",
-    "z_14": "Chelate_Entropy_Thermodynamic_Misattribution",
+    "z_00": "Atomic_&_Nuclear_Concepts",
+    "z_01": "Periodic_Trends_&_Properties",
+    "z_02": "Bonding_&_Molecular_Structure",
+    "z_03": "Coordination_&_Thermodynamics"
 }
 
 # Fallback option data when CSV is absent
 _FALLBACK_RECORD = {
     "misconception_tag": "unknown_error",
     "misconception_tags": ["unknown_error"],
-    "z_vector": np.zeros(15, dtype=float),
+    "z_vector": np.zeros(4, dtype=float),
     "error_class":       "conceptual_error",
     "severity":          "medium",
     "trap_weight":       0.0,

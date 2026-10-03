@@ -20,7 +20,13 @@ DEFAULT_COEFFICIENTS = {
     "semantic": -1.6,
     "empirical": -1.2,
     "ambiguity": 0.8,
+    "semantic_x_difficulty": -0.8,
 }
+
+
+def _difficulty_gate(d_param: float) -> float:
+    """Bounded difficulty factor in [0, 1] for the E_sem x d interaction."""
+    return 0.5 + 0.5 * float(np.tanh(float(d_param)))
 
 
 class DynamicC:
@@ -46,7 +52,13 @@ class DynamicC:
         for _, row in df.iterrows():
             item_id = str(row["item_id"])
             semantic = float(row.get("semantic_entrapment", row.get("entrapment_index", 0.0)))
-            features = {"semantic": semantic, "empirical": 0.0, "ambiguity": 0.0}
+            difficulty = float(row.get("d_param", 0.0))
+            features = {
+                "semantic": semantic,
+                "empirical": 0.0,
+                "ambiguity": 0.0,
+                "difficulty": difficulty,
+            }
             self._item_features[item_id] = features
             self._c_map[item_id] = self._compute(**features)
 
@@ -54,14 +66,17 @@ class DynamicC:
         if item_id in self._c_map:
             return self._c_map[item_id]
         if entrapment_index is not None:
-            return self._compute(float(entrapment_index), 0.0, 0.0)
+            return self._compute(float(entrapment_index), 0.0, 0.0, 0.0)
         return 0.25
 
-    def _compute(self, semantic: float, empirical: float, ambiguity: float) -> float:
+    def _compute(self, semantic: float, empirical: float, ambiguity: float,
+                 difficulty: float = 0.0) -> float:
         b = self.coefficients
         logit = (b["intercept"] + b["semantic"] * float(semantic)
                  + b["empirical"] * float(empirical)
-                 + b["ambiguity"] * float(ambiguity))
+                 + b["ambiguity"] * float(ambiguity)
+                 + b.get("semantic_x_difficulty", 0.0)
+                 * float(semantic) * _difficulty_gate(difficulty))
         return float(np.clip(0.25 / (1.0 + np.exp(-logit)), 0.01, 0.25))
 
     def record_response(self, item_id: str, selected_option: int, correct: bool) -> None:

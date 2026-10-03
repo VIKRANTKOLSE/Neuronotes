@@ -56,8 +56,8 @@ def infer_severity(error_class: str, z_vec: list[int]) -> str:
     return "low"
 
 def infer_trap_weight(z_vec: list[int]) -> float:
-    """Normalised entrapment weight from a 15-dim z-vector."""
-    return round(sum(z_vec) / 15.0, 4)
+    """Normalised entrapment weight from a 4-dim z-vector."""
+    return round(sum(z_vec) / 4.0, 4)
 
 def infer_misconception_tag(z_vec: list[int]) -> str:
     """Return the ontology key for an option's active z dimension.
@@ -112,6 +112,19 @@ def parse_vec(s: str) -> list:
     except Exception:
         return []
 
+def compress_z_vec(z: list) -> list:
+    """Compresses 15D z-vector down to 4D macro-categories."""
+    if not z:
+        return [0.0, 0.0, 0.0, 0.0]
+    if len(z) < 15:
+        z = z + [0.0] * (15 - len(z))
+    return [
+        float(max(z[0:4])),
+        float(max(z[4:8])),
+        float(max(z[8:12])),
+        float(max(z[12:15]))
+    ]
+
 # ---------------------------------------------------------------------------
 # 2. Build items_clean.csv
 # ---------------------------------------------------------------------------
@@ -119,10 +132,10 @@ def build_items_clean(df: pd.DataFrame) -> pd.DataFrame:
     records = []
     for _, row in df.iterrows():
         a_vec  = parse_vec(row["a_vector"])
-        z1     = parse_vec(row["z1"])
-        z2     = parse_vec(row["z2"])
-        z3     = parse_vec(row["z3"])
-        z4     = parse_vec(row["z4"])
+        z1     = compress_z_vec(parse_vec(row["z1"]))
+        z2     = compress_z_vec(parse_vec(row["z2"]))
+        z3     = compress_z_vec(parse_vec(row["z3"]))
+        z4     = compress_z_vec(parse_vec(row["z4"]))
 
         # Pad / truncate a_vector to exactly N_DIMS
         if len(a_vec) < N_DIMS:
@@ -135,7 +148,7 @@ def build_items_clean(df: pd.DataFrame) -> pd.DataFrame:
         wrong_zs   = [z for i, z in enumerate([z1, z2, z3, z4])
                       if (i + 1) != correct_opt]
         trap_weights = [infer_trap_weight(z) for z in wrong_zs]
-        entrapment_index = round(sum(trap_weights) / len(trap_weights), 4) if trap_weights else 0.0
+        entrapment_index = float(row.get("E_semantic", round(sum(trap_weights) / len(trap_weights), 4) if trap_weights else 0.0))
 
         # Empirical and ambiguity terms are filled by DynamicC after attempts.
         c_j = initial_dynamic_c(entrapment_index)
@@ -156,7 +169,7 @@ def build_items_clean(df: pd.DataFrame) -> pd.DataFrame:
             "entrapment_index":   entrapment_index,
             "semantic_entrapment": entrapment_index,
             "empirical_entrapment": 0.0,
-            "ambiguity_index":    0.0,
+            "ambiguity_index":    float(row.get("E_ambiguity", 0.0)),
             "c_j":                c_j,
             # Provide sensible defaults for metadata absent from qmatrix
             "estimated_time_sec": int(row.get("estimated_time_sec", 90)),
@@ -185,7 +198,7 @@ def build_item_options(df: pd.DataFrame) -> pd.DataFrame:
         for opt_no in range(1, 5):
             opt_text = str(row[f"opt{opt_no}"])
             reason   = str(row[f"reason{opt_no}"])
-            z_vec    = parse_vec(row[f"z{opt_no}"])
+            z_vec    = compress_z_vec(parse_vec(row[f"z{opt_no}"]))
             is_correct = (opt_no == correct_opt)
 
             if is_correct:
@@ -291,6 +304,13 @@ CONCEPT_PREREQ_MAP = {
     # Solubility
     "Solubility Product and Precipitation Logic": ["Lattice Energy", "Charge Density (Z/r) and Ionic Potential"],
 }
+
+# Bidirectional DAG maps: invert the prerequisite map so evidence can also
+# diffuse DOWNWARD (failed parent -> penalize children), not just upward.
+CONCEPT_CHILDREN_MAP: dict[str, list[str]] = {}
+for _child, _prereqs in CONCEPT_PREREQ_MAP.items():
+    for _prereq in _prereqs:
+        CONCEPT_CHILDREN_MAP.setdefault(_prereq, []).append(_child)
 
 def build_concept_graph(all_concepts: list[str]) -> pd.DataFrame:
     records = []

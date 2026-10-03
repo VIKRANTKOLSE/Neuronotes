@@ -32,9 +32,9 @@ N_SEMANTIC_DIMS = 15
 
 # Hyperparameters for residual-variance dynamic learning rate (eta_s)
 BETA: float = 0.9      # Forgetting factor for the exponential moving average
-ETA_MAX: float = 0.5   # Upper bound learning rate for consistent performance
-ETA_MIN: float = 0.05  # Lower bound learning rate to guarantee non-zero learning
-RHO: float = 10.0      # Scaling sensitivity factor
+ETA_MAX: float = 1.5   # Upper bound learning rate for consistent performance
+ETA_MIN: float = 0.3  # Lower bound learning rate to guarantee non-zero learning
+RHO: float = 2.0      # Scaling sensitivity factor
 
 
 class DynamicLearningRateResult(NamedTuple):
@@ -109,7 +109,7 @@ class LearnerState:
     # Continuous posterior-like evidence for every shared ontology slot.
     # This is the score used for AUROC; the dict above is retained for routing.
     misconception_probs: np.ndarray = field(
-        default_factory=lambda: np.full(N_SEMANTIC_DIMS, 0.10, dtype=float)
+        default_factory=lambda: np.full(N_SEMANTIC_DIMS, 0.05, dtype=float)
     )
     repeat_count: dict = field(default_factory=dict)
     response_history: list = field(default_factory=list)
@@ -137,10 +137,8 @@ class SMDVSNLMSUpdater:
         self.use_dynamic_lr = use_dynamic_lr
         self.total_session_length = total_session_length
         if semantic_matrix is None:
-            # Weak prior: every shared ontology slot initially maps to one
-            # ability axis; observations refine these values online.
+            # Initialize purely as zero to prevent double-penalty before learning
             self.B = np.zeros((N_DIMS, N_SEMANTIC_DIMS), dtype=float)
-            self.B[np.arange(N_SEMANTIC_DIMS) % N_DIMS, np.arange(N_SEMANTIC_DIMS)] = -0.05
         else:
             matrix = np.asarray(semantic_matrix, dtype=float)
             if matrix.shape != (N_DIMS, N_SEMANTIC_DIMS):
@@ -214,10 +212,47 @@ class SMDVSNLMSUpdater:
         import math
         alpha_t = self.semantic_alpha / math.sqrt(1.0 + 0.05 * step_t)
 
-        eta = step_base_lr * class_scale * repetition / max(np.linalg.norm(a_vec), 1e-6)
+        if hasattr(self, "mirt") and hasattr(self.mirt, "diffusion_matrix"):
+            effective_a = self.mirt.diffusion_matrix @ a_vec
+        else:
+            effective_a = a_vec
+
+        eta = step_base_lr * class_scale * repetition / max(np.linalg.norm(effective_a), 1e-6)
         semantic_term = np.zeros(N_DIMS) if correct else alpha_t * (self.B @ z)
-        delta = eta * (residual * a_vec + semantic_term) + self.momentum * state.previous_delta
+        
+        delta = eta * (residual * effective_a + semantic_term) + self.momentum * state.previous_delta
         state.theta = np.clip(state.theta + delta, -4.0, 4.0)
+        
+        # Track tested dimensions
+        if not hasattr(state, 'tested_mask'):
+            state.tested_mask = np.zeros(N_DIMS, dtype=bool)
+        state.tested_mask |= (a_vec > 0)
+
+        # Track Bifactor Global Ability
+        if not hasattr(state, 'global_ability'):
+            state.global_ability = 0.0
+        
+        # Update global ability based on residual (general mathematical ability)
+        eta_g = 0.10 # Lightweight learning rate for global ability
+        state.global_ability += eta_g * residual
+        state.global_ability = np.clip(state.global_ability, -4.0, 4.0)
+        
+        # Anchor untested dimensions to adaptive per-tier priors to minimize RMSE
+        untested_mask = ~state.tested_mask
+        if untested_mask.any():
+            tier_slices = [slice(0,10), slice(10,23), slice(23,40), slice(40,58)]
+            mu = np.full(N_DIMS, state.global_ability)
+            for ts in tier_slices:
+                tested_in_tier = state.tested_mask[ts]
+                if tested_in_tier.any():
+                    mu[ts] = np.mean(state.theta[ts][tested_in_tier])
+                else:
+                    mu[ts] = state.global_ability
+            
+            # Gently pull untested traits toward their tier's empirical mean
+            state.theta[untested_mask] = 0.5 * state.theta[untested_mask] + 0.5 * mu[untested_mask]
+            
+            
         state.previous_delta = delta
 
         # Update B symmetrically with centered residual on both correct and incorrect:
@@ -226,32 +261,44 @@ class SMDVSNLMSUpdater:
         if correct:
             if z_mask is not None and np.any(z_mask):
                 mask_vec = self._z_vector(z_mask)
-                self.B += self.semantic_matrix_lr * np.outer(residual * a_vec, mask_vec)
+                self.B -= self.semantic_matrix_lr * np.outer(residual * a_vec, mask_vec)
                 self.B = np.clip(self.B, -1.0, 1.0)
         elif np.any(z):
-            self.B += self.semantic_matrix_lr * np.outer(residual * a_vec, z)
+            self.B -= self.semantic_matrix_lr * np.outer(residual * a_vec, z)
             self.B = np.clip(self.B, -1.0, 1.0)
 
         from .cc_mirt import CONCEPT_DIM_MAP
         dim = CONCEPT_DIM_MAP.get(concept, 0)
         state.concept_theta[concept] = float(state.theta[dim])
 
-        # Continuous misconception evidence. A wrong distractor is positive
-        # evidence only for the ontology slots it activates; a correct answer
-        # decays only the specific misconception traps present on that item.
+        # Continuous misconception evidence
+        N = total_session_length if total_session_length is not None else getattr(self, "total_session_length", 30)
+        # Base decay for correct items (weaken misconception)
+        lambda_decay = 0.10
+        
         if correct:
-            N = total_session_length if total_session_length is not None else getattr(self, "total_session_length", 30)
-            lambda_decay = min(0.05, 1.5 / max(int(N), 1))
-            if z_mask is not None:
+            if z_mask is not None and np.any(z_mask):
                 mask = np.asarray(z_mask, dtype=float).reshape(-1)
                 mask = np.pad(mask[:N_SEMANTIC_DIMS], (0, max(0, N_SEMANTIC_DIMS - len(mask))))
             else:
                 mask = np.ones(N_SEMANTIC_DIMS, dtype=float)
+            
             state.misconception_probs *= (1.0 - lambda_decay * mask)
-        elif np.any(z):
-            severity_scale = {"high": 1.2, "medium": 1.0, "low": 0.6}.get(severity, 1.0)
-            update_rate = MISC_STRENGTH * severity_scale
-            state.misconception_probs += update_rate * z * (1.0 - state.misconception_probs)
+        else:
+            if np.any(z):
+                severity_scale = {"high": 1.2, "medium": 1.0, "low": 0.6}.get(severity, 1.0)
+                # Scale update_rate by p_correct: unexpected errors (high p_correct) provide stronger evidence of misconception
+                # rather than just low general ability guessing.
+                update_rate = 0.35 * severity_scale * p_correct
+                state.misconception_probs += update_rate * z * (1.0 - state.misconception_probs)
+            
+            # Decay the unchosen misconceptions present in this item
+            if z_mask is not None and np.any(z_mask):
+                mask = np.asarray(z_mask, dtype=float).reshape(-1)
+                mask = np.pad(mask[:N_SEMANTIC_DIMS], (0, max(0, N_SEMANTIC_DIMS - len(mask))))
+                unchosen_mask = np.clip(mask - z, 0.0, 1.0)
+                state.misconception_probs *= (1.0 - lambda_decay * unchosen_mask)
+            
         state.misconception_probs = np.clip(state.misconception_probs, 0.001, 0.999)
 
         if not correct:

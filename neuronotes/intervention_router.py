@@ -18,6 +18,7 @@ Intervention types
 
 from dataclasses import dataclass
 from typing import Optional
+import numpy as np
 
 # Thresholds
 REPEAT_HINT_THRESH      = 1   # 1st wrong → explanation
@@ -132,13 +133,23 @@ class InterventionRouter:
         prereqs = self._prereq_map.get(concept, [])
 
         if theta_val < THETA_LOW_THRESH and prereqs:
+            # Find the immediate prerequisite with the lowest ability
+            weakest_prereq = prereqs[0]
+            lowest_theta = float('inf')
+            for pr in prereqs:
+                p_dim = CONCEPT_DIM_MAP.get(pr, 0)
+                p_theta = float(theta[p_dim]) if hasattr(theta, "__len__") else float(theta)
+                if p_theta < lowest_theta:
+                    lowest_theta = p_theta
+                    weakest_prereq = pr
+
             return Intervention(
                 intervention_type="PREREQ_Q",
                 message=(
-                    f"Your foundation on '{prereqs[0]}' needs strengthening before "
+                    f"Your foundation on '{weakest_prereq}' needs strengthening before "
                     f"tackling '{concept}'. Let's revisit the prerequisite."
                 ),
-                target_concept=prereqs[0],
+                target_concept=weakest_prereq,
                 misconception_tag=misconception_tag,
             )
 

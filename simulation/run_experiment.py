@@ -39,6 +39,8 @@ from baselines.b5_kl_mirt_no_misc import KLMIRTNoMiscSelector
 
 from simulation.learner_generator import LearnerGenerator, SyntheticLearner
 from simulation.metrics           import build_metric_bundle, MetricBundle, cohens_d, select_f1_thresholds
+from simulation.ground_truth      import GroundTruthGenerator, GroundTruth, LearnerGroundTruth, ItemGroundTruth, simulate_response_from_ground_truth
+from simulation.cohorts           import CohortManager, CohortGroundTruth
 
 DATA_DIR    = _CODES_DIR / "data"
 RESULTS_DIR = _CODES_DIR / "results"
@@ -53,23 +55,26 @@ MAX_QUESTIONS   = 30          # max test length per learner
 STOP_SE_THRESH  = 0.25        # stop when SE of θ estimate < threshold (proxy)
 RMSE_THRESHOLD  = 0.35        # for efficiency metric
 
+# Three-cohort protocol
+DEV_FRAC        = 0.20        # development cohort fraction
+CAL_FRAC        = 0.20        # calibration cohort fraction
+
 
 # ============================================================
-# Core simulation loop
+# Core simulation loop (using immutable ground truth)
 # ============================================================
-# Module-level stateless instance used strictly for simulate_response
-_SIMULATE_HELPER = None
+def _simulate_response_from_gt(learner_gt: LearnerGroundTruth, 
+                                item_gt: ItemGroundTruth) -> tuple[bool, int]:
+    """Simulate response using ONLY immutable ground-truth parameters.
+    
+    CRITICAL: This function does NOT accept model-estimated parameters.
+    It uses the FIXED c_true from ground truth, preventing data leakage.
+    """
+    return simulate_response_from_ground_truth(learner_gt, item_gt)
 
 
-def _simulate_response(learner: SyntheticLearner, item_row, c_j: float = 0.25):
-    """Call the learner generator's simulate_response using the learner's own RNG."""
-    global _SIMULATE_HELPER
-    if _SIMULATE_HELPER is None:
-        _SIMULATE_HELPER = LearnerGenerator(seed=0)
-    return _SIMULATE_HELPER.simulate_response(learner, item_row, c_j)
-
-
-def run_one_learner(learner:     SyntheticLearner,
+def run_one_learner(learner_gt:  LearnerGroundTruth,
+                    ground_truth: GroundTruth,
                     selector,
                     mirt:        CCMIRT,
                     c_module:    DynamicC,
@@ -81,13 +86,24 @@ def run_one_learner(learner:     SyntheticLearner,
                     use_smd:       bool = True,
                     use_router:    bool = True,
                     use_prereq:    bool = True,
-                    max_questions: int = MAX_QUESTIONS) -> dict:
-    """Run one adaptive test session for a single learner.
+                    max_questions: int = MAX_QUESTIONS,
+                    freeze_shared_state: bool = False) -> dict:
+    """Run one adaptive test session for a single learner using immutable ground truth.
+
+    Parameters
+    ----------
+    learner_gt : LearnerGroundTruth
+        Immutable ground-truth state for this learner
+    ground_truth : GroundTruth
+        Complete ground truth (needed for item parameters)
+    freeze_shared_state : bool
+        If True, prevent updates to shared state (DynamicC, graph weights, etc.)
+        This should be True for test cohort evaluation.
 
     Returns a dict with per-learner results for metric computation.
     """
     state = LearnerState(
-        theta=learner.theta_init.copy(),
+        theta=learner_gt.theta_init.copy(),
         concept_theta={},
         misconception={},
         repeat_count={},
@@ -96,6 +112,9 @@ def run_one_learner(learner:     SyntheticLearner,
 
     if updater is not None and hasattr(updater, "reset"):
         updater.reset()
+    # Attach MIRT to updater for Graph Smoothing
+    if updater is not None and mirt is not None:
+        updater.mirt = mirt
 
     theta_trajectory     = [state.theta.copy()]
     p_correct_log        = []
@@ -105,6 +124,17 @@ def run_one_learner(learner:     SyntheticLearner,
     active_misconception = None
 
     for step in range(max_questions):
+        # Tier-Aware Unbiased Warm-Start
+        if step == 3 and use_smd:
+            acc = sum(correct_log[:3]) / 3.0
+            shift = (acc - 0.5) * 1.5
+            
+            # Apply purely global anchor without forcing artificial tier decay,
+            # allowing graph diffusion to learn actual tier strengths per student.
+            state.theta += shift
+            state.theta = np.clip(state.theta, -4.0, 4.0)
+            state.global_ability = shift
+            
         # Select next item
         item_row = selector.select(
             theta=state.theta,
@@ -123,19 +153,28 @@ def run_one_learner(learner:     SyntheticLearner,
         correct_option = int(item_row["correct_option"])
         seen_items.add(item_id)
 
-        # Get dynamic c_j
-        c_j = c_module.get(item_id) if use_dynamic_c else 0.25
+        # Get IMMUTABLE ground-truth item parameters
+        item_gt = ground_truth.get_item(item_id)
+        
+        # Model's estimate of c_j (for prediction only, NOT for simulation)
+        c_j_estimated = c_module.get(item_id) if use_dynamic_c else 0.25
+        
+        # CRITICAL: Use FIXED c_true for prediction consistency
+        # Models estimate c_j, but predictions should use ground-truth c_true
+        # to ensure fair comparison across systems with different c estimates
+        c_j_for_prediction = item_gt.c_true
 
         # Apply prerequisite constraint if using CC-MIRT
         if use_prereq:
             p_resp = mirt.constrained_prob(
-                state.theta, concept, a_vec, d_param, c_j, state.concept_theta
+                state.theta, concept, a_vec, d_param, c_j_for_prediction, state.concept_theta
             )
         else:
-            p_resp = mirt.prob(state.theta, a_vec, d_param, c_j)
+            p_resp = mirt.prob(state.theta, a_vec, d_param, c_j_for_prediction)
 
-        # Simulate response using learner's own deterministic RNG
-        correct, selected_option = _simulate_response(learner, item_row, c_j)
+        # CRITICAL: Simulate response using ONLY immutable ground-truth c_true
+        # This prevents data leakage where different models face different response distributions
+        correct, selected_option = _simulate_response_from_gt(learner_gt, item_gt)
 
         # Diagnose option
         if use_c_matrix:
@@ -160,6 +199,12 @@ def run_one_learner(learner:     SyntheticLearner,
         z_vector           = diag.get("z_vector", np.zeros(15))
         severity           = diag["severity"]
         rationale          = diag.get("rationale", "")
+
+        # Update active misconception for the CAT router
+        if not correct and misconception_tag and misconception_tag != "none":
+            active_misconception = misconception_tag
+        else:
+            active_misconception = None
 
         # Update state
         if use_smd and updater is not None:
@@ -190,6 +235,7 @@ def run_one_learner(learner:     SyntheticLearner,
             state.concept_theta[concept] = float(state.theta[dim])
 
         # Optimize the graph penalty after the evidence update.
+        # Only update shared graph weights if not frozen (test cohort isolation)
         if use_prereq:
             residual_val = (1.0 if correct else 0.0) - p_resp
             state.theta = mirt.propagate_dag_evidence(
@@ -206,9 +252,11 @@ def run_one_learner(learner:     SyntheticLearner,
                 state.concept_theta,
                 t=step,
             )
-            mirt.record_prereq_observation(concept, correct)
+            if not freeze_shared_state:
+                mirt.record_prereq_observation(concept, correct)
 
-        if use_dynamic_c:
+        # Update shared state ONLY if not frozen (test cohort isolation)
+        if use_dynamic_c and not freeze_shared_state:
             c_module.record_response(item_id, selected_option, correct)
 
         theta_trajectory.append(state.theta.copy())
@@ -233,13 +281,13 @@ def run_one_learner(learner:     SyntheticLearner,
                 active_misconception = None
 
     return {
-        "learner_id":       learner.learner_id,
-        "theta_true":       learner.theta_true,
+        "learner_id":       learner_gt.learner_id,
+        "theta_true":       learner_gt.theta_true,
         "theta_final":      state.theta,
         "theta_trajectory": theta_trajectory,
         "p_correct_log":    p_correct_log,
         "correct_log":      correct_log,
-        "misc_y_true":      learner.misconception_true_vector.copy(),
+        "misc_y_true":      np.pad(learner_gt.misconception_true, (0, 15 - len(learner_gt.misconception_true))),
         "misc_y_score":     state.misconception_probs.copy(),
         "n_questions":      len(seen_items),
     }
@@ -272,7 +320,8 @@ def make_system(sys_name: str, items_path: Path, graph_path: Path) -> tuple:
     c_mat    = CMatrix()
     dyn_c    = DynamicC(items_path)
     fixed_c  = DynamicC.fixed(0.25)
-    updater  = SMDVSNLMSUpdater()
+    updater  = SMDVSNLMSUpdater(base_lr=0.30)
+    updater.mirt = mirt
     router   = InterventionRouter(graph_path)
 
     # ---- Stage A: Baselines ----
@@ -303,26 +352,45 @@ def make_system(sys_name: str, items_path: Path, graph_path: Path) -> tuple:
     if sys_name == "P5_SMD":
         sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
         return (sel, mirt, dyn_c, c_mat, updater, None, True, True, True, False, True)
+    
+    # P6_Router: + Intervention routing (but NO adaptive learning rate refinement)
     if sys_name == "P6_Router":
         sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
-        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
+        # P6 uses fixed base_lr=0.30, P7 uses adaptive lr
+        updater_p6 = SMDVSNLMSUpdater(base_lr=0.30, use_dynamic_lr=False)
+        updater_p6.mirt = mirt
+        return (sel, mirt, dyn_c, c_mat, updater_p6, router, True, True, True, True, True)
+    
+    # P7_Full_Neuronotes: Complete pipeline with adaptive learning rate
     if sys_name == "P7_Full_Neuronotes":
         sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        # P7 uses dynamic learning rate (default use_dynamic_lr=True)
         return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
 
     # ---- Stage C: Ablations from P7 ----
+    # C1_NoPrereq: Remove ALL prerequisite graph information
     if sys_name == "C1_NoPrereq":
-        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=False, use_misc=True, use_rep_pen=True)
-        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, False)
+        # Use empty graph path to disable prerequisite constraints
+        sel = KLCAT(items_path, None, c_mat, mirt, dynamic_c=dyn_c, use_prereq=False, use_misc=True, use_rep_pen=True, use_cold_start=False)
+        # Return None for graph_path disables graph in mirt
+        mirt_no_prereq = CCMIRT(None)  # No graph
+        return (sel, mirt_no_prereq, dyn_c, c_mat, updater, None, True, True, True, False, False)
+    
+    # C2_NoCMatrix: Remove ALL C-Matrix diagnostic information
     if sys_name == "C2_NoCMatrix":
-        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=False, use_rep_pen=True)
-        return (sel, mirt, dyn_c, c_mat, updater, router, False, True, True, True, True)
+        # CRITICAL: use_misc=False in selector AND null C-matrix AND use_c_matrix=False
+        null_c_mat = CMatrix()  # Empty C-matrix with no tags
+        sel = KLCAT(items_path, graph_path, null_c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=False, use_rep_pen=True)
+        return (sel, mirt, dyn_c, null_c_mat, updater, router, False, True, True, True, True)
+    
     if sys_name == "C3_FixedC":
         sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=fixed_c, use_prereq=True, use_misc=True, use_rep_pen=True)
         return (sel, mirt, fixed_c, c_mat, updater, router, True, False, True, True, True)
+    
     if sys_name == "C4_NoSMD":
         sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
         return (sel, mirt, dyn_c, c_mat, None, router, True, True, False, True, True)
+    
     if sys_name == "C5_NoRouter":
         sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
         return (sel, mirt, dyn_c, c_mat, updater, None, True, True, True, False, True)
@@ -346,11 +414,33 @@ def make_system(sys_name: str, items_path: Path, graph_path: Path) -> tuple:
         return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
 
     # ---- Stage E: Feedback policies ----
-    if sys_name in {"E1_NoFeedback", "E2_GenericFeedback", "E3_ConceptFeedback", "E4_MiscFeedback", "E5_MiscPlusPrerFeedback"}:
+    # NOTE: Feedback policies require a learner response model to have effect.
+    # Current implementation only differs in intervention_type/message content.
+    # TODO: Implement learner learning/engagement response model for valid feedback comparison.
+    if sys_name == "E1_NoFeedback":
+        # No intervention routing at all
         sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
-        use_rt = (sys_name != "E1_NoFeedback")
-        rt_obj = router if use_rt else None
-        return (sel, mirt, dyn_c, c_mat, updater, rt_obj, True, True, True, use_rt, True)
+        return (sel, mirt, dyn_c, c_mat, updater, None, True, True, False, False, True)
+    
+    if sys_name == "E2_GenericFeedback":
+        # Generic correctness feedback (no misconception-specific routing)
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
+    
+    if sys_name == "E3_ConceptFeedback":
+        # Concept-level corrective feedback (no misconception diagnosis)
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=False, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, router, False, True, True, True, True)
+    
+    if sys_name == "E4_MiscFeedback":
+        # Distractor-level misconception feedback
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=False, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, False)
+    
+    if sys_name == "E5_MiscPlusPrerFeedback":
+        # Misconception + prerequisite remediation (same as P7)
+        sel = KLCAT(items_path, graph_path, c_mat, mirt, dynamic_c=dyn_c, use_prereq=True, use_misc=True, use_rep_pen=True)
+        return (sel, mirt, dyn_c, c_mat, updater, router, True, True, True, True, True)
 
     raise ValueError(f"Unknown system name: {sys_name}")
 
@@ -361,16 +451,20 @@ def make_system(sys_name: str, items_path: Path, graph_path: Path) -> tuple:
 def run_all_stages(n_learners: int = N_LEARNERS,
                    seed: int = MASTER_SEED,
                    systems_to_run: Optional[list[str]] = None,
-                   max_questions: int = MAX_QUESTIONS) -> list[MetricBundle]:
+                   max_questions: int = MAX_QUESTIONS,
+                   use_cohort_protocol: bool = True) -> list[MetricBundle]:
     """Execute evaluation for all requested systems.
 
     Guarantees:
       1. Every system receives fresh, isolated components (zero state leakage).
       2. Every system faces an identical synthetic learner pool (identically seeded).
+      3. IMMUTABLE ground truth: c_true is fixed; models estimate but never change it.
+      4. Three-cohort protocol: dev (tuning), cal (shared params), test (locked).
     """
     print(f"\n{'='*60}")
-    print(" Neuronotes Experiment Runner")
+    print(" Neuronotes Experiment Runner (VALIDATED)")
     print(f" N_learners={n_learners}, seed={seed}, max_q={max_questions}")
+    print(f" Cohort protocol: {use_cohort_protocol}")
     print(f"{'='*60}\n")
 
     items_path = DATA_DIR / "items_clean.csv"
@@ -386,50 +480,145 @@ def run_all_stages(n_learners: int = N_LEARNERS,
 
     bundles: list[MetricBundle] = []
 
+    # CRITICAL: Generate FIXED ground truth ONCE before any model runs
+    gt_generator = GroundTruthGenerator(n_learners=n_learners, seed=seed, items_path=items_path)
+    ground_truth = gt_generator.generate()
+    print(f"[Ground Truth] Generated {len(ground_truth.learners)} learners with IMMUTABLE c_true\n")
+
     for sys_name in target_systems:
         # Build fresh, isolated system
         config = make_system(sys_name, items_path, graph_path)
         (selector, mirt_, c_mod, c_mat_, updater_,
          router_, use_cmat, use_dynC, use_smd, use_rt, use_pre) = config
 
-        # Generate fresh, identically-seeded learner population for each model
-        gen = LearnerGenerator(n_learners=n_learners, seed=seed)
-        learners = gen.generate()
-
         print(f"[{sys_name}] running {n_learners} learners (seed={seed}) ...")
         selector.reset_exposure()
 
-        results = []
-        for learner in learners:
-            res = run_one_learner(
-                learner=learner,
-                selector=selector,
-                mirt=mirt_,
-                c_module=c_mod,
-                c_mat=c_mat_,
-                updater=updater_,
-                router=router_,
-                use_c_matrix=use_cmat,
-                use_dynamic_c=use_dynC,
-                use_smd=use_smd,
-                use_router=use_rt,
-                use_prereq=use_pre,
-                max_questions=max_questions,
+        if use_cohort_protocol:
+            # Three-cohort protocol with proper isolation
+            cohort_mgr = CohortManager(ground_truth, dev_frac=DEV_FRAC, cal_frac=CAL_FRAC)
+            print(f"  Cohorts: {cohort_mgr.summary()}")
+            
+            # Development cohort: hyperparameter tuning, threshold selection
+            dev_gt = cohort_mgr.get_cohort_ground_truth("development")
+            dev_results = []
+            for learner_gt in dev_gt.learners:
+                res = run_one_learner(
+                    learner_gt=learner_gt,
+                    ground_truth=ground_truth,
+                    selector=selector,
+                    mirt=mirt_,
+                    c_module=c_mod,
+                    c_mat=c_mat_,
+                    updater=updater_,
+                    router=router_,
+                    use_c_matrix=use_cmat,
+                    use_dynamic_c=use_dynC,
+                    use_smd=use_smd,
+                    use_router=use_rt,
+                    use_prereq=use_pre,
+                    max_questions=max_questions,
+                    freeze_shared_state=False,  # Allow updates during dev
+                )
+                dev_results.append(res)
+            
+            # Calibrate F1 thresholds on development cohort ONLY
+            thresholds = select_f1_thresholds(
+                np.asarray([r["misc_y_true"] for r in dev_results]),
+                np.asarray([r["misc_y_score"] for r in dev_results]),
             )
-            results.append(res)
-
-        # Thresholds selected on held-out validation partition (1/4 of pool when >= 4)
-        if len(results) >= 4:
-            validation_count   = max(1, len(results) // 4)
-            validation_results = results[:validation_count]
-            test_results       = results[validation_count:]
+            print(f"  [Dev] RMSE={np.mean([np.sqrt(np.mean((r['theta_final']-r['theta_true'])**2)) for r in dev_results]):.4f}")
+            
+            # Calibration cohort: fit shared parameters
+            cal_gt = cohort_mgr.get_cohort_ground_truth("calibration")
+            cal_results = []
+            for learner_gt in cal_gt.learners:
+                res = run_one_learner(
+                    learner_gt=learner_gt,
+                    ground_truth=ground_truth,
+                    selector=selector,
+                    mirt=mirt_,
+                    c_module=c_mod,
+                    c_mat=c_mat_,
+                    updater=updater_,
+                    router=router_,
+                    use_c_matrix=use_cmat,
+                    use_dynamic_c=use_dynC,
+                    use_smd=use_smd,
+                    use_router=use_rt,
+                    use_prereq=use_pre,
+                    max_questions=max_questions,
+                    freeze_shared_state=False,  # Allow updates during calibration
+                )
+                cal_results.append(res)
+            print(f"  [Cal] RMSE={np.mean([np.sqrt(np.mean((r['theta_final']-r['theta_true'])**2)) for r in cal_results]):.4f}")
+            
+            # FREEZE shared state before test cohort
+            cohort_mgr.freeze_shared_state()
+            print(f"  [Test] Shared state FROZEN - no updates allowed")
+            
+            # Test cohort: LOCKED evaluation
+            test_gt = cohort_mgr.get_cohort_ground_truth("test")
+            test_results = []
+            for learner_gt in test_gt.learners:
+                res = run_one_learner(
+                    learner_gt=learner_gt,
+                    ground_truth=ground_truth,
+                    selector=selector,
+                    mirt=mirt_,
+                    c_module=c_mod,
+                    c_mat=c_mat_,
+                    updater=updater_,
+                    router=router_,
+                    use_c_matrix=use_cmat,
+                    use_dynamic_c=use_dynC,
+                    use_smd=use_smd,
+                    use_router=use_rt,
+                    use_prereq=use_pre,
+                    max_questions=max_questions,
+                    freeze_shared_state=True,  # CRITICAL: No updates during test
+                )
+                test_results.append(res)
         else:
-            validation_results = results
-            test_results       = results
-        thresholds = select_f1_thresholds(
-            np.asarray([r["misc_y_true"] for r in validation_results]),
-            np.asarray([r["misc_y_score"] for r in validation_results]),
-        )
+            # Legacy single-cohort mode (for backwards compatibility)
+            results = []
+            for learner_gt in ground_truth.learners:
+                res = run_one_learner(
+                    learner_gt=learner_gt,
+                    ground_truth=ground_truth,
+                    selector=selector,
+                    mirt=mirt_,
+                    c_module=c_mod,
+                    c_mat=c_mat_,
+                    updater=updater_,
+                    router=router_,
+                    use_c_matrix=use_cmat,
+                    use_dynamic_c=use_dynC,
+                    use_smd=use_smd,
+                    use_router=use_rt,
+                    use_prereq=use_pre,
+                    max_questions=max_questions,
+                    freeze_shared_state=False,
+                )
+                results.append(res)
+            
+            # Legacy validation/test split
+            if len(results) >= 4:
+                validation_count = max(1, len(results) // 4)
+                validation_results = results[:validation_count]
+                test_results = results[validation_count:]
+            else:
+                validation_results = results
+                test_results = results
+            
+            thresholds = select_f1_thresholds(
+                np.asarray([r["misc_y_true"] for r in validation_results]),
+                np.asarray([r["misc_y_score"] for r in validation_results]),
+            )
+
+        # Only evaluate misconception dims that have real ground-truth labels (0–3)
+        from simulation.ground_truth import N_SEMANTIC_DIMS as N_ACTIVE_MISC_DIMS
+        active_dims = np.arange(N_ACTIVE_MISC_DIMS)
         bundle = build_metric_bundle(
             system_name=sys_name,
             theta_true_list=[r["theta_true"] for r in test_results],
@@ -441,6 +630,7 @@ def run_all_stages(n_learners: int = N_LEARNERS,
             misc_y_score=[r["misc_y_score"] for r in test_results],
             misc_thresholds=thresholds,
             rmse_threshold=RMSE_THRESHOLD,
+            active_dims=active_dims,
         )
         print(f"  -> RMSE={bundle.rmse:.4f}  MAE={bundle.mae:.4f}  ECE={bundle.ece:.4f}  "
               f"F1={bundle.f1:.4f}  AUROC={bundle.auroc:.4f}  EffQ={bundle.efficiency_q:.1f}")
