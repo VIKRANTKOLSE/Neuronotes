@@ -128,7 +128,7 @@ class LearnerGenerator:
             }
 
             learners.append(SyntheticLearner(
-                learner_id=f"L{i:04d}",
+                learner_id=f"S{self.seed}_L{i:04d}",
                 profile=profile,
                 theta_true=theta_true,
                 theta_init=np.zeros(N_DIMS),

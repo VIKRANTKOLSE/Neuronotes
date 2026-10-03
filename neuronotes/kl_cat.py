@@ -22,7 +22,7 @@ import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 from .cc_mirt  import CCMIRT, CONCEPT_DIM_MAP, N_DIMS, parse_a_vector
 from .c_matrix import CMatrix
@@ -181,7 +181,10 @@ class KLCAT:
                seen_items:      set,
                concept_thetas:  dict,
                misconception_state: dict,
-               active_misconception: Optional[str] = None) -> Optional[pd.Series]:
+               active_misconception: Optional[str] = None,
+               repeated_items: Optional[set] = None,
+               repeat_discount: float = 0.5,
+               tested_dims: Optional[Any] = None) -> Optional[pd.Series]:
         """Return the best item row from items_clean or None if bank exhausted.
 
         Fully vectorised over the candidate pool for speed.
@@ -262,6 +265,26 @@ class KLCAT:
         # ---- Combined utility ----
         scores   = (self.w_kl * kl_gain + self.w_pre * pre
                     + self.w_mis * mis - self.w_rep * rep + 0.5 * cold)
+
+        # Coverage bonus: encourage testing dimensions that haven't been tested yet in this session
+        if tested_dims is not None and len(candidate_indices) > 0:
+            dims = self._concept_dims[candidate_indices]
+            # If tested_dims is a boolean mask of shape (N_DIMS,)
+            if isinstance(tested_dims, np.ndarray) and tested_dims.dtype == bool:
+                untested_indicator = (~tested_dims[dims]).astype(float)
+            elif isinstance(tested_dims, (set, list, tuple)):
+                untested_indicator = np.array([1.0 if d not in tested_dims else 0.0 for d in dims], dtype=float)
+            else:
+                untested_indicator = np.zeros(len(candidate_indices))
+            # Modest exploration bonus to explore new dimensions
+            scores += 0.25 * untested_indicator
+
+        # SpacedCAT: discount repeated items so unseen items rank higher
+        if repeated_items:
+            is_rep = np.isin(cand_ids, list(repeated_items))
+            # Multiply positive utilities by discount, scale negative if needed
+            scores = np.where(is_rep, scores * repeat_discount, scores)
+
         best_pos = int(np.argmax(scores))
         best_idx = candidate_indices[best_pos]
         best_row = self._items.iloc[best_idx]

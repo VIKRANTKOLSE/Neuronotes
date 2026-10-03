@@ -180,7 +180,8 @@ class SMDVSNLMSUpdater:
                misconception_tags: Optional[list[str]] = None,
                z_mask: Optional[np.ndarray] = None,
                total_session_length: Optional[int] = None,
-               t: Optional[int] = None) -> LearnerState:
+               t: Optional[int] = None,
+               repeat_discount: float = 1.0) -> LearnerState:
         """Apply one ontology-aware SMD-VSNLMS update in place."""
         del d_param  # retained in the public API for backwards compatibility
         z = self._z_vector(z_vector)
@@ -217,7 +218,7 @@ class SMDVSNLMSUpdater:
         else:
             effective_a = a_vec
 
-        eta = step_base_lr * class_scale * repetition / max(np.linalg.norm(effective_a), 1e-6)
+        eta = step_base_lr * class_scale * repetition * repeat_discount / max(np.linalg.norm(effective_a), 1e-6)
         semantic_term = np.zeros(N_DIMS) if correct else alpha_t * (self.B @ z)
         
         delta = eta * (residual * effective_a + semantic_term) + self.momentum * state.previous_delta
@@ -240,17 +241,27 @@ class SMDVSNLMSUpdater:
         # Anchor untested dimensions to adaptive per-tier priors to minimize RMSE
         untested_mask = ~state.tested_mask
         if untested_mask.any():
-            tier_slices = [slice(0,10), slice(10,23), slice(23,40), slice(40,58)]
-            mu = np.full(N_DIMS, state.global_ability)
-            for ts in tier_slices:
-                tested_in_tier = state.tested_mask[ts]
-                if tested_in_tier.any():
-                    mu[ts] = np.mean(state.theta[ts][tested_in_tier])
-                else:
-                    mu[ts] = state.global_ability
+            tier_slices = [slice(0, 10), slice(10, 23), slice(23, 40), slice(40, 58)]
+            is_warm = getattr(state, "is_warm_start", False)
+            warm_prior = getattr(state, "warm_prior", None)
             
-            # Gently pull untested traits toward their tier's empirical mean
-            state.theta[untested_mask] = 0.5 * state.theta[untested_mask] + 0.5 * mu[untested_mask]
+            if is_warm and warm_prior is not None:
+                # In warm start, untested traits have strong prior knowledge from past sessions.
+                # Regularize them toward warm prior shifted slightly by current session global performance:
+                global_shift = state.global_ability - float(np.mean(warm_prior))
+                target = warm_prior[untested_mask] + 0.3 * global_shift
+                state.theta[untested_mask] = 0.8 * state.theta[untested_mask] + 0.2 * target
+            else:
+                mu = np.full(N_DIMS, state.global_ability)
+                for ts in tier_slices:
+                    tested_in_tier = state.tested_mask[ts]
+                    if tested_in_tier.any():
+                        mu[ts] = np.mean(state.theta[ts][tested_in_tier])
+                    else:
+                        mu[ts] = state.global_ability
+                
+                # Gently pull untested traits toward their tier's empirical mean
+                state.theta[untested_mask] = 0.5 * state.theta[untested_mask] + 0.5 * mu[untested_mask]
             
             
         state.previous_delta = delta

@@ -218,7 +218,55 @@ Examples:
     parser.add_argument("--calibrate-threshold", type=int, default=0, metavar="N",
                         help="Enable offline E recalibration after every N learners (e.g. 1000). "
                              "0 = disabled (default).")
+    parser.add_argument("--persist-sessions", action="store_true",
+                        help="Enable SQLite multi-user state persistence across sessions.")
+    parser.add_argument("--store-path", type=str, default=None,
+                        help="Path to SQLite learner store database file.")
+    parser.add_argument("--decay-lambda", type=float, default=0.05,
+                        help="Exponential forgetting rate per elapsed day for warm-start theta (default: 0.05).")
+    parser.add_argument("--delete-learner", type=str, default=None, metavar="ID",
+                        help="Delete a specific learner's records from SQLite store and exit.")
+    parser.add_argument("--reset-learner-store", action="store_true",
+                        help="Wipe all learner sessions and history from SQLite store and exit.")
+    parser.add_argument("--show-learner", type=str, default=None, metavar="ID",
+                        help="Display stored state and history for a specific learner and exit.")
+    parser.add_argument("--list-learners", action="store_true",
+                        help="List all saved learners in SQLite store and exit.")
     args = parser.parse_args()
+
+    # Handle direct store management actions
+    if args.delete_learner or args.reset_learner_store or args.show_learner or args.list_learners:
+        from neuronotes.learner_store import LearnerStore
+        store = LearnerStore(args.store_path or (RESULTS_DIR / "learner_store.db"))
+        try:
+            if args.delete_learner:
+                deleted = store.delete_learner(args.delete_learner)
+                if deleted:
+                    print(f"[Store] Successfully deleted learner '{args.delete_learner}'")
+                else:
+                    print(f"[Store] Learner '{args.delete_learner}' not found in store")
+            elif args.reset_learner_store:
+                count = store.clear_all()
+                print(f"[Store] Successfully cleared store ({count} learner profile(s) wiped)")
+            elif args.show_learner:
+                rec = store.get_learner(args.show_learner)
+                if rec:
+                    print(f"\n[Learner Profile: {rec.learner_id}]")
+                    print(f"  Sessions: {rec.session_count}")
+                    print(f"  Total questions: {rec.total_questions_answered}")
+                    print(f"  Last active: {rec.last_session_time}")
+                    print(f"  Theta ({rec.dim}D): {np.round(rec.theta, 3)}")
+                    print(f"  Seen items: {len(store.get_seen_items(rec.learner_id))}")
+                else:
+                    print(f"[Store] Learner '{args.show_learner}' not found")
+            elif args.list_learners:
+                learners = store.list_learners()
+                print(f"\n[Saved Learners in Store: {len(learners)}]")
+                for l in learners:
+                    print(f"  - {l['learner_id']}: {l['session_count']} sessions, {l['total_questions_answered']} questions (last active: {l['last_session_time']})")
+        finally:
+            store.close()
+        return
 
     # Determine seed list
     if args.seeds:
@@ -268,7 +316,10 @@ Examples:
             print(f"\n>>> Running Seed {seed_idx}/{len(seeds_to_run)} (seed={s}) <<<")
         bundles = run_all_stages(n_learners=args.learners, seed=s,
                                  systems_to_run=systems_to_run,
-                                 max_questions=args.max_questions)
+                                 max_questions=args.max_questions,
+                                 persist_sessions=args.persist_sessions,
+                                 store_path=args.store_path,
+                                 decay_lambda=args.decay_lambda)
         all_seed_bundles.append(bundles)
 
         # Check if offline recalibration should fire

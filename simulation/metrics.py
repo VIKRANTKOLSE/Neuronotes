@@ -79,6 +79,8 @@ def select_f1_thresholds(y_true: np.ndarray, y_score: np.ndarray,
     fixed 0.5 cutoff, adapting to each misconception family's prevalence.
     """
     y_true, y_score = np.asarray(y_true, dtype=int), np.asarray(y_score, dtype=float)
+    if y_true.size == 0 or y_true.ndim < 2 or y_true.shape[1] == 0:
+        return np.full(15, default, dtype=float)
     thresholds = np.full(y_true.shape[1], default, dtype=float)
     for dimension in range(y_true.shape[1]):
         labels, scores = y_true[:, dimension], y_score[:, dimension]

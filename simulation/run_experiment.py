@@ -16,6 +16,7 @@ Returns a list of MetricBundle objects for all evaluated systems.
 import sys
 import numpy as np
 import pandas as pd
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,7 @@ from neuronotes.dynamic_c         import DynamicC
 from neuronotes.smd_vsnlms        import SMDVSNLMSUpdater, LearnerState
 from neuronotes.kl_cat            import KLCAT
 from neuronotes.intervention_router import InterventionRouter
+from neuronotes.learner_store     import LearnerStore
 
 from baselines.b1_random          import RandomSelector
 from baselines.b2_staircase       import StaircaseSelector
@@ -87,7 +89,11 @@ def run_one_learner(learner_gt:  LearnerGroundTruth,
                     use_router:    bool = True,
                     use_prereq:    bool = True,
                     max_questions: int = MAX_QUESTIONS,
-                    freeze_shared_state: bool = False) -> dict:
+                    freeze_shared_state: bool = False,
+                    learner_store: Optional[LearnerStore] = None,
+                    persist_sessions: bool = False,
+                    decay_lambda: float = 0.05,
+                    session_id: Optional[str] = None) -> dict:
     """Run one adaptive test session for a single learner using immutable ground truth.
 
     Parameters
@@ -99,16 +105,45 @@ def run_one_learner(learner_gt:  LearnerGroundTruth,
     freeze_shared_state : bool
         If True, prevent updates to shared state (DynamicC, graph weights, etc.)
         This should be True for test cohort evaluation.
+    learner_store : Optional[LearnerStore]
+        SQLite persistence store for learner ability and history.
+    persist_sessions : bool
+        If True, load warm-start theta and record final session state.
+    decay_lambda : float
+        Exponential forgetting rate per elapsed day for warm-start theta.
+    session_id : Optional[str]
+        Identifier for this test session.
 
     Returns a dict with per-learner results for metric computation.
     """
+    session_start_time = datetime.now(timezone.utc)
+    session_questions = []
+
+    init_theta = learner_gt.theta_init.copy()
+    is_warm_start = False
+    if persist_sessions and learner_store is not None:
+        warm_theta = learner_store.get_warm_start_theta(
+            learner_id=learner_gt.learner_id,
+            theta_prior=init_theta,
+            lambda_decay=decay_lambda,
+            current_time=session_start_time,
+        )
+        if warm_theta is not None:
+            init_theta = warm_theta
+            is_warm_start = True
+
     state = LearnerState(
-        theta=learner_gt.theta_init.copy(),
+        theta=init_theta,
         concept_theta={},
         misconception={},
         repeat_count={},
         response_history=[],
     )
+    state.tested_mask = np.zeros(N_DIMS, dtype=bool)
+    state.is_warm_start = is_warm_start
+    if is_warm_start:
+        state.warm_prior = init_theta.copy()
+        state.global_ability = float(np.mean(init_theta))
 
     if updater is not None and hasattr(updater, "reset"):
         updater.reset()
@@ -120,12 +155,20 @@ def run_one_learner(learner_gt:  LearnerGroundTruth,
     p_correct_log        = []
     correct_log          = []
 
-    seen_items = set()
+    current_session_seen = set()
+    prior_eligibility = None
+    all_prior_items = set()
+    if persist_sessions and learner_store is not None:
+        prior_eligibility = learner_store.get_spaced_review_eligibility(
+            learner_gt.learner_id, max_recent_sessions=2
+        )
+        all_prior_items = prior_eligibility["all_prior_items"]
+
     active_misconception = None
 
     for step in range(max_questions):
-        # Tier-Aware Unbiased Warm-Start
-        if step == 3 and use_smd:
+        # Tier-Aware Unbiased Warm-Start (Cold start ONLY to escape zero prior)
+        if step == 3 and use_smd and not is_warm_start:
             acc = sum(correct_log[:3]) / 3.0
             shift = (acc - 0.5) * 1.5
             
@@ -135,14 +178,35 @@ def run_one_learner(learner_gt:  LearnerGroundTruth,
             state.theta = np.clip(state.theta, -4.0, 4.0)
             state.global_ability = shift
             
-        # Select next item
-        item_row = selector.select(
-            theta=state.theta,
-            seen_items=seen_items,
-            concept_thetas=state.concept_theta,
-            misconception_state=state.misconception,
-            active_misconception=active_misconception,
-        )
+        # SpacedCAT: Current session items are strictly blocked (0 repeats in session).
+        # Prior correct items blocked unless concept has no unseen items left.
+        # Prior wrong items remain eligible for spaced review / remediation.
+        blocked_items = set(current_session_seen)
+        if prior_eligibility:
+            blocked_items.update(prior_eligibility["correct_items"])
+
+        # Select next item (repeated items discounted 0.5x in utility)
+        select_kwargs = {
+            "theta": state.theta,
+            "seen_items": blocked_items,
+            "concept_thetas": state.concept_theta,
+            "misconception_state": state.misconception,
+            "active_misconception": active_misconception,
+        }
+        if hasattr(selector, "select"):
+            varnames = selector.select.__code__.co_varnames
+            if "repeated_items" in varnames:
+                select_kwargs["repeated_items"] = all_prior_items
+                select_kwargs["repeat_discount"] = 0.5
+            if "tested_dims" in varnames:
+                select_kwargs["tested_dims"] = state.tested_mask
+
+        item_row = selector.select(**select_kwargs)
+        # If pool exhausted with correct items blocked, fallback to allow prior correct items
+        if item_row is None and prior_eligibility and blocked_items != current_session_seen:
+            select_kwargs["seen_items"] = set(current_session_seen)
+            item_row = selector.select(**select_kwargs)
+
         if item_row is None:
             break
 
@@ -151,7 +215,8 @@ def run_one_learner(learner_gt:  LearnerGroundTruth,
         a_vec    = parse_a_vector(item_row["a_vector"])
         d_param  = float(item_row["d_param"])
         correct_option = int(item_row["correct_option"])
-        seen_items.add(item_id)
+        current_session_seen.add(item_id)
+        is_repeated_item = (item_id in all_prior_items)
 
         # Get IMMUTABLE ground-truth item parameters
         item_gt = ground_truth.get_item(item_id)
@@ -175,6 +240,13 @@ def run_one_learner(learner_gt:  LearnerGroundTruth,
         # CRITICAL: Simulate response using ONLY immutable ground-truth c_true
         # This prevents data leakage where different models face different response distributions
         correct, selected_option = _simulate_response_from_gt(learner_gt, item_gt)
+
+        session_questions.append({
+            "item_id": item_id,
+            "concept": concept,
+            "correct": bool(correct),
+            "timestamp": datetime.now(timezone.utc),
+        })
 
         # Diagnose option
         if use_c_matrix:
@@ -206,6 +278,9 @@ def run_one_learner(learner_gt:  LearnerGroundTruth,
         else:
             active_misconception = None
 
+        # Repeat learning rate discount to prevent memorization bias
+        learning_rate_discount = 0.8 if is_repeated_item else 1.0
+
         # Update state
         if use_smd and updater is not None:
             state = updater.update(
@@ -224,12 +299,13 @@ def run_one_learner(learner_gt:  LearnerGroundTruth,
                 z_mask=z_mask,
                 total_session_length=max_questions,
                 t=step,
+                repeat_discount=learning_rate_discount,
             )
         else:
             # Fallback: simple gradient update (no semantic weighting)
             residual     = (1 if correct else 0) - p_resp
             a_norm       = max(np.linalg.norm(a_vec), 1e-6)
-            mu_eff       = 0.15 / a_norm  # conservative step to prevent divergence
+            mu_eff       = (0.15 / a_norm) * learning_rate_discount  # conservative step to prevent divergence
             state.theta  = np.clip(state.theta + mu_eff * residual * a_vec, -4, 4)
             dim = CONCEPT_DIM_MAP.get(concept, 0)
             state.concept_theta[concept] = float(state.theta[dim])
@@ -280,6 +356,19 @@ def run_one_learner(learner_gt:  LearnerGroundTruth,
             elif iv.intervention_type == "NORMAL_Q":
                 active_misconception = None
 
+    if persist_sessions and learner_store is not None:
+        sess_id = session_id or f"sess_{session_start_time.strftime('%Y%m%d_%H%M%S')}_{learner_gt.learner_id}"
+        learner_store.save_learner_session(
+            learner_id=learner_gt.learner_id,
+            session_id=sess_id,
+            theta=state.theta,
+            concept_theta=state.concept_theta,
+            misconception_probs=state.misconception_probs,
+            questions_record=session_questions,
+            session_start=session_start_time,
+            session_end=datetime.now(timezone.utc),
+        )
+
     return {
         "learner_id":       learner_gt.learner_id,
         "theta_true":       learner_gt.theta_true,
@@ -289,7 +378,7 @@ def run_one_learner(learner_gt:  LearnerGroundTruth,
         "correct_log":      correct_log,
         "misc_y_true":      np.pad(learner_gt.misconception_true, (0, 15 - len(learner_gt.misconception_true))),
         "misc_y_score":     state.misconception_probs.copy(),
-        "n_questions":      len(seen_items),
+        "n_questions":      len(current_session_seen),
     }
 
 
@@ -452,7 +541,10 @@ def run_all_stages(n_learners: int = N_LEARNERS,
                    seed: int = MASTER_SEED,
                    systems_to_run: Optional[list[str]] = None,
                    max_questions: int = MAX_QUESTIONS,
-                   use_cohort_protocol: bool = True) -> list[MetricBundle]:
+                   use_cohort_protocol: bool = True,
+                   persist_sessions: bool = False,
+                   store_path: Optional[str | Path] = None,
+                   decay_lambda: float = 0.05) -> list[MetricBundle]:
     """Execute evaluation for all requested systems.
 
     Guarantees:
@@ -465,7 +557,11 @@ def run_all_stages(n_learners: int = N_LEARNERS,
     print(" Neuronotes Experiment Runner (VALIDATED)")
     print(f" N_learners={n_learners}, seed={seed}, max_q={max_questions}")
     print(f" Cohort protocol: {use_cohort_protocol}")
+    if persist_sessions:
+        print(f" Session persistence: ENABLED (decay_lambda={decay_lambda})")
     print(f"{'='*60}\n")
+
+    store = LearnerStore(store_path or (RESULTS_DIR / "learner_store.db")) if persist_sessions else None
 
     items_path = DATA_DIR / "items_clean.csv"
     graph_path = DATA_DIR / "concept_graph.csv"
@@ -577,6 +673,9 @@ def run_all_stages(n_learners: int = N_LEARNERS,
                     use_prereq=use_pre,
                     max_questions=max_questions,
                     freeze_shared_state=True,  # CRITICAL: No updates during test
+                    learner_store=store,
+                    persist_sessions=persist_sessions,
+                    decay_lambda=decay_lambda,
                 )
                 test_results.append(res)
         else:
@@ -599,6 +698,9 @@ def run_all_stages(n_learners: int = N_LEARNERS,
                     use_prereq=use_pre,
                     max_questions=max_questions,
                     freeze_shared_state=False,
+                    learner_store=store,
+                    persist_sessions=persist_sessions,
+                    decay_lambda=decay_lambda,
                 )
                 results.append(res)
             
@@ -635,6 +737,9 @@ def run_all_stages(n_learners: int = N_LEARNERS,
         print(f"  -> RMSE={bundle.rmse:.4f}  MAE={bundle.mae:.4f}  ECE={bundle.ece:.4f}  "
               f"F1={bundle.f1:.4f}  AUROC={bundle.auroc:.4f}  EffQ={bundle.efficiency_q:.1f}")
         bundles.append(bundle)
+
+    if store is not None:
+        store.close()
 
     return bundles
 

@@ -1,2 +1,2 @@
 system,n_seeds,n_learners,mean_questions,rmse,rmse_std,rmse_ci95_lo,rmse_ci95_hi,mae,mae_std,ece,precision,recall,f1,f1_std,auroc,auroc_std,auroc_micro,valid_misconception_dims,efficiency_q
-P7_Full_Neuronotes,5,120,30.0,0.766,0.0208,0.7402,0.7919,0.6404,0.0199,0.0728,0.3079,0.476,0.3136,0.0361,0.6866,0.0451,0.6837,4,30.0
+P7_Full_Neuronotes,1,60,30.0,0.7047,0.0,0.7047,0.7047,0.5798,0.0,0.0413,0.3389,0.3118,0.3064,0.0,0.6424,0.0,0.6249,4,

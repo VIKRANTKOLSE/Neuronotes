@@ -13,6 +13,7 @@ from .smd_vsnlms        import (
 )
 from .kl_cat            import KLCAT
 from .intervention_router import InterventionRouter
+from .learner_store     import LearnerStore, LearnerRecord
 
 __all__ = [
     "CCMIRT",
@@ -27,4 +28,6 @@ __all__ = [
     "RHO",
     "KLCAT",
     "InterventionRouter",
+    "LearnerStore",
+    "LearnerRecord",
 ]

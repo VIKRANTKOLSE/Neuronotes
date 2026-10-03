@@ -235,7 +235,7 @@ class GroundTruthGenerator:
             misconception_true, misconception_strength = self._generate_misconceptions(theta_true)
             
             learners.append(LearnerGroundTruth(
-                learner_id=f"L{i:04d}",
+                learner_id=f"S{self.seed}_L{i:04d}",
                 theta_true=theta_true,
                 theta_init=np.zeros(N_DIMS),
                 misconception_true=misconception_true,
